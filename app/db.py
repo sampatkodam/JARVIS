@@ -30,6 +30,15 @@ CREATE TABLE IF NOT EXISTS steps (
     updated_at TEXT NOT NULL,
     UNIQUE(task_id, step_no)
 );
+CREATE TABLE IF NOT EXISTS task_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'info',
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_logs_task_created
+    ON task_logs(task_id, created_at, id);
 '''
 
 
