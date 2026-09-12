@@ -1,6 +1,6 @@
-# JARVIS V0.3
+# JARVIS V0.3.1
 
-Lightweight, cloud-first autonomous personal agent with a persistent background task queue, live execution logs, and safe task controls.
+Lightweight, cloud-first autonomous personal agent with a persistent background task queue, live execution logs, safe task controls, and hardened queue scheduling/claiming.
 
 ## Included
 - FastAPI backend
@@ -11,6 +11,8 @@ Lightweight, cloud-first autonomous personal agent with a persistent background 
 - Background worker started with the FastAPI application
 - Clean worker checkpoints for pause and cancellation
 - Automatic retry with bounded exponential backoff (up to 3 retries)
+- Canonical timezone-aware UTC timestamps for queue metadata
+- Atomic multi-worker task claiming using SQLite `BEGIN IMMEDIATE`
 - Persistent per-task live logs with UTC timestamps and log levels
 - Per-task log API with incremental `after_id` streaming semantics
 - Automatic web UI refresh every 2 seconds
@@ -39,7 +41,14 @@ uvicorn app.main:app --reload
 
 Open http://127.0.0.1:8000
 
-The worker starts automatically with FastAPI. Creating a task puts it in `waiting`; the worker claims it and changes it to `running`. Transient execution failures move the task to `retrying`, then back to `waiting` when the backoff expires. Tasks can be paused, resumed, or cancelled from the dashboard.
+The worker starts automatically with FastAPI. Creating a task puts it in `waiting`; the worker claims it and changes it to `running`. Transient execution failures move the task to `retrying`, then become eligible again only after the persisted UTC backoff timestamp is reached. Tasks can be paused, resumed, or cancelled from the dashboard.
+
+## Queue hardening
+- All queue-generated timestamps use timezone-aware UTC ISO-8601 strings, including `next_run_at`.
+- Retry scheduling is calculated in Python and persisted as an absolute UTC timestamp instead of SQLite's timezone-less `datetime()` text.
+- Eligibility compares canonical ISO timestamps consistently, so retry tasks cannot run early because of timestamp-format mismatches.
+- Task claiming uses a SQLite `BEGIN IMMEDIATE` transaction around selection and state transition. Concurrent workers therefore serialize the claim operation and only one worker can transition a particular task from `waiting`/`retrying` to `running`.
+- Claim/retry lifecycle logs are written after the queue transaction is released, avoiding nested SQLite write locks.
 
 ## Task controls
 - **Pause** on `waiting`/`retrying` tasks moves them immediately to `paused` and removes them from the runnable queue.
@@ -60,14 +69,28 @@ API:
 
 `after_id` enables incremental polling; `limit` is capped at 1000.
 
+## Tests
+Queue hardening tests use Python's standard-library `unittest`, so no additional test dependency is required.
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The test suite verifies:
+- two concurrent workers cannot both claim the same task;
+- retry timestamps are timezone-aware UTC ISO-8601 values;
+- retry backoff is persisted as an absolute future UTC timestamp;
+- a retrying task is not claimable before its backoff expires;
+- the task becomes claimable after the scheduled backoff.
+
 ## Queue behavior
 1. API creates a task in `waiting` and writes the first log entry.
-2. The worker claims one eligible task and marks it `running`.
+2. The worker atomically claims one eligible task and marks it `running`.
 3. Worker lifecycle and execution events are persisted to `task_logs`.
 4. The planner/executor/critic loop runs in the worker.
 5. Pause/cancel requests are persisted and checked at safe execution checkpoints.
 6. Successful execution ends in `completed`.
-7. Worker exceptions enter `retrying` with bounded backoff and a log entry.
+7. Worker exceptions enter `retrying` with bounded UTC backoff and a log entry.
 8. After 3 retries the task becomes `failed`.
 9. Task metadata, control flags, retry count, next-run time, heartbeat, log history, and step history survive process restarts because they are stored in SQLite.
 10. Stale running tasks are recovered when the worker starts.
@@ -84,6 +107,6 @@ API:
 - `POST /api/tasks/{task_id}/cancel` — cancel a queued, paused, or running task
 
 ## Autonomy
-JARVIS retains the planner -> executor -> critic loop. V0.3 adds durable task controls so the queue can be safely paused, resumed, or cancelled without relying on in-memory worker state. Running tasks stop only at explicit safe checkpoints instead of leaving a half-updated task record.
+JARVIS retains the planner -> executor -> critic loop. V0.3 adds durable task controls. V0.3.1 hardens the queue's scheduling and concurrency guarantees so future multi-worker execution has a reliable persistence layer.
 
 This remains a development baseline. Its shell safety policy is intentionally conservative but is not a production-grade sandbox.
