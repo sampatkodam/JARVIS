@@ -9,7 +9,7 @@ from app.db import connect
 from app.config import BASE_DIR
 from app.queue import TaskWorker
 from app.gemini import Gemini
-from app.memory import add_message, conversation_history, extract_memories, extract_workspace_memory, memory_context, new_conversation, search_memories, task_history
+from app.memory import add_message, conversation_history, extract_memories, extract_workspace_memory, memory_context, new_conversation, search_memories, task_history, upsert_memory
 
 worker = TaskWorker()
 
@@ -24,8 +24,7 @@ STATIC = BASE_DIR / "web"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 @app.get("/")
-def index():
-    return FileResponse(STATIC / "index.html")
+def index(): return FileResponse(STATIC / "index.html")
 
 @app.get("/api/health")
 def health():
@@ -34,13 +33,11 @@ def health():
 
 @app.get("/api/tasks")
 def tasks():
-    with connect() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()]
+    with connect() as conn: return [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()]
 
 @app.post("/api/tasks", status_code=201)
 def new_task(payload: CreateTask):
-    task_id = create_task(payload.goal)
-    return get_task(task_id)
+    task_id = create_task(payload.goal); return get_task(task_id)
 
 @app.get("/api/tasks/{task_id}")
 def task(task_id: str):
@@ -57,8 +54,7 @@ def task_logs(task_id: str, after_id: int = Query(0, ge=0), limit: int = Query(5
 def run(task_id: str):
     if not get_task(task_id): raise HTTPException(404, "Task not found")
     with connect() as conn:
-        changed = conn.execute("""UPDATE tasks SET status='waiting', next_run_at=NULL, error=NULL,
-            pause_requested=0, cancel_requested=0, updated_at=? WHERE id=? AND status IN ('failed','cancelled')""", (datetime.now(timezone.utc).isoformat(), task_id)).rowcount
+        changed = conn.execute("UPDATE tasks SET status='waiting', next_run_at=NULL, error=NULL, pause_requested=0, cancel_requested=0, updated_at=? WHERE id=? AND status IN ('failed','cancelled')", (datetime.now(timezone.utc).isoformat(), task_id)).rowcount
     if changed: log_task(task_id, "Task manually requeued.")
     return RunResponse(task_id=task_id, status="waiting", message="Task queued for background execution.")
 
@@ -84,12 +80,10 @@ def cancel(task_id: str):
     return {"task_id":task_id, "status":status, "message":"Cancellation accepted." if status in ("cancelled","cancelling") else "Task is already terminal."}
 
 @app.post("/api/conversations")
-def create_conversation(title: str | None = None):
-    return {"conversation_id": new_conversation(title)}
+def create_conversation(title: str | None = None): return {"conversation_id":new_conversation(title)}
 
 @app.get("/api/conversations/{conversation_id}")
-def get_conversation(conversation_id: str, limit: int = Query(40, ge=1, le=200)):
-    return {"conversation_id":conversation_id, "messages":conversation_history(conversation_id, limit)}
+def get_conversation(conversation_id: str, limit: int = Query(40, ge=1, le=200)): return {"conversation_id":conversation_id, "messages":conversation_history(conversation_id, limit)}
 
 @app.post("/api/conversations/{conversation_id}/messages")
 def conversation_message(conversation_id: str, payload: dict):
@@ -97,7 +91,7 @@ def conversation_message(conversation_id: str, payload: dict):
     if not content or len(content) > 20000: raise HTTPException(400, "content is required and must be <= 20000 characters")
     add_message(conversation_id, "user", content)
     history = conversation_history(conversation_id, 40)
-    prompt = "Answer the user using the conversation history and relevant long-term memory. Be accurate and do not claim actions you did not perform.\n\nLONG-TERM MEMORY:\n" + memory_context(content) + "\n\nTASK HISTORY:\n" + "\n".join(str(x) for x in task_history(8)) + "\n\nCONVERSATION:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history)
+    prompt = "Answer the user using conversation history, task history, and relevant long-term memory. Never invent actions or facts.\n\nLONG-TERM MEMORY:\n" + memory_context(content) + "\n\nTASK HISTORY:\n" + "\n".join(str(x) for x in task_history(8)) + "\n\nCONVERSATION:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history)
     answer = Gemini().json(prompt, "You are JARVIS. Return JSON: {\"answer\":\"...\"}").get("answer", "")
     add_message(conversation_id, "assistant", answer)
     extract_memories(f"User: {content}\nAssistant: {answer}", scope="global", source_type="conversation", source_id=conversation_id)
@@ -108,10 +102,15 @@ def memory_search(q: str = Query(..., min_length=1), limit: int = Query(20, ge=1
     return {"query":q, "memories":search_memories(q, limit)}
 
 @app.get("/api/memory/tasks")
-def memory_tasks(limit: int = Query(30, ge=1, le=100)):
-    return {"tasks":task_history(limit)}
+def memory_tasks(limit: int = Query(30, ge=1, le=100)): return {"tasks":task_history(limit)}
+
+@app.post("/api/memory")
+def write_memory(payload: dict):
+    scope = str(payload.get("scope", "global")); scope_id = payload.get("scope_id"); kind = str(payload.get("kind", "fact")); key = str(payload.get("key", "")).strip(); content = str(payload.get("content", "")).strip()
+    if scope not in {"global", "project", "workspace", "task", "conversation"} or not key or not content: raise HTTPException(400, "scope, key and content are required")
+    mid = upsert_memory(scope, scope_id, kind, key, content, "manual")
+    return {"memory_id":mid}
 
 @app.post("/api/memory/workspace/extract")
 def memory_workspace_extract():
-    ids = extract_workspace_memory()
-    return {"stored_memory_ids":ids, "count":len(ids)}
+    ids = extract_workspace_memory(); return {"stored_memory_ids":ids, "count":len(ids)}
