@@ -10,6 +10,7 @@ from app.config import BASE_DIR
 from app.queue import TaskWorker
 from app.gemini import Gemini
 from app.memory import add_message, conversation_history, extract_memories, extract_workspace_memory, memory_context, new_conversation, search_memories, task_history, upsert_memory
+from app.memory_migration import migration_status, start_embedding_migration
 
 worker = TaskWorker()
 
@@ -27,7 +28,7 @@ def index(): return FileResponse(STATIC / "index.html")
 @app.get("/api/health")
 def health():
     alive = bool(worker.thread and worker.thread.is_alive())
-    return {"status":"ok", "service":"jarvis", "version":"0.4.0", "worker":"running" if alive else "stopped"}
+    return {"status":"ok", "service":"jarvis", "version":"0.4.0", "worker":"running" if alive else "stopped", "memory_migration":migration_status()}
 
 @app.get("/api/tasks")
 def tasks():
@@ -113,3 +114,11 @@ def write_memory(payload: dict):
 @app.post("/api/memory/workspace/extract")
 def memory_workspace_extract():
     ids = extract_workspace_memory(); return {"stored_memory_ids":ids, "count":len(ids)}
+
+@app.post("/api/memory/embeddings/migrate")
+def memory_embeddings_migrate():
+    return start_embedding_migration()
+
+@app.get("/api/memory/embeddings/migrate")
+def memory_embeddings_migrate_status():
+    return migration_status()
