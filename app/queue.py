@@ -1,4 +1,3 @@
-import time
 from datetime import datetime, timezone
 from threading import Event, Thread
 
@@ -7,14 +6,29 @@ from app.db import connect
 
 POLL_INTERVAL_SECONDS = 1.0
 MAX_RETRIES = 3
+RECOVER_AFTER_SECONDS = 300
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def recover_stale_tasks():
+    """Return interrupted running tasks to the durable queue after a restart/crash."""
+    with connect() as conn:
+        conn.execute(
+            """UPDATE tasks
+               SET status='waiting', next_run_at=NULL, worker_heartbeat_at=NULL,
+                   error=COALESCE(error, 'Recovered after worker interruption.'), updated_at=?
+               WHERE status='running'
+                 AND (worker_heartbeat_at IS NULL
+                      OR worker_heartbeat_at < datetime('now', ?))""",
+            (now(), f"-{RECOVER_AFTER_SECONDS} seconds"),
+        )
+
+
 def claim_next_task():
-    """Atomically claim one waiting/retrying task so multiple workers are safe."""
+    """Atomically claim one waiting/retrying task so multiple workers do not own it."""
     with connect() as conn:
         row = conn.execute(
             """SELECT id FROM tasks
@@ -37,23 +51,21 @@ def claim_next_task():
 
 def mark_retry(task_id: str, error: str):
     with connect() as conn:
-        row = conn.execute(
-            "SELECT retry_count FROM tasks WHERE id=?", (task_id,)
-        ).fetchone()
+        row = conn.execute("SELECT retry_count FROM tasks WHERE id=?", (task_id,)).fetchone()
         retries = int(row["retry_count"] if row else 0) + 1
         if retries <= MAX_RETRIES:
-            # Small fixed backoff keeps V0.2 deterministic while preventing a hot loop.
             delay = min(60, 2 ** retries)
             conn.execute(
                 """UPDATE tasks
                    SET status='retrying', retry_count=?, next_run_at=datetime('now', ?),
-                       error=?, updated_at=?
+                       error=?, worker_heartbeat_at=NULL, updated_at=?
                    WHERE id=?""",
                 (retries, f"+{delay} seconds", error, now(), task_id),
             )
         else:
             conn.execute(
-                """UPDATE tasks SET status='failed', retry_count=?, error=?, updated_at=?
+                """UPDATE tasks
+                   SET status='failed', retry_count=?, error=?, worker_heartbeat_at=NULL, updated_at=?
                    WHERE id=?""",
                 (retries, error, now(), task_id),
             )
@@ -79,6 +91,7 @@ class TaskWorker:
     def start(self):
         if self.thread and self.thread.is_alive():
             return
+        recover_stale_tasks()
         self.stop_event.clear()
         self.thread = Thread(target=worker_loop, args=(self.stop_event,), daemon=True, name="jarvis-task-worker")
         self.thread.start()
