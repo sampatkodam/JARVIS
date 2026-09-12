@@ -1,10 +1,10 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from app.models import CreateTask, RunResponse
-from app.agent import create_task, get_task, cancel_task
+from app.agent import create_task, get_task, get_task_logs, cancel_task, log_task
 from app.db import connect
 from app.config import BASE_DIR
 from app.queue import TaskWorker
@@ -38,8 +38,7 @@ def health():
 @app.get("/api/tasks")
 def tasks():
     with connect() as conn:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM tasks ORDER BY created_at DESC").fetchall()]
+        return [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()]
 
 
 @app.post("/api/tasks", status_code=201)
@@ -56,17 +55,26 @@ def task(task_id: str):
     return result
 
 
+@app.get("/api/tasks/{task_id}/logs")
+def task_logs(task_id: str, after_id: int = Query(0, ge=0), limit: int = Query(500, ge=1, le=1000)):
+    if not get_task(task_id):
+        raise HTTPException(404, "Task not found")
+    return {"task_id": task_id, "logs": get_task_logs(task_id, after_id, limit)}
+
+
 @app.post("/api/tasks/{task_id}/run", response_model=RunResponse)
 def run(task_id: str):
     record = get_task(task_id)
     if not record:
         raise HTTPException(404, "Task not found")
     with connect() as conn:
-        conn.execute(
+        changed = conn.execute(
             """UPDATE tasks SET status='waiting', next_run_at=NULL, error=NULL, updated_at=?
                WHERE id=? AND status IN ('failed','cancelled')""",
             (datetime.now(timezone.utc).isoformat(), task_id),
-        )
+        ).rowcount
+    if changed:
+        log_task(task_id, "Task manually requeued.")
     return RunResponse(task_id=task_id, status="waiting", message="Task queued for background execution.")
 
 
