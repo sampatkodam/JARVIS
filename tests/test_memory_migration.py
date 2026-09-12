@@ -34,16 +34,19 @@ class MemoryMigrationTests(unittest.TestCase):
         with patch("app.memory.Gemini", FakeGemini), patch("app.memory_migration.Gemini", FakeGemini):
             existing = upsert_memory("global", None, "fact", "existing", "Already embedded")
             pending = upsert_memory("global", None, "fact", "pending", "Needs embedding")
-            # The upsert above creates embeddings via the mocked Gemini, so remove one to simulate a legacy row.
             with db.connect() as conn:
                 conn.execute("UPDATE memories SET embedding=NULL, embedding_model=NULL WHERE id=?", (pending,))
             migration._run()
         status = migration.migration_status()
         self.assertEqual(status["status"], "completed")
-        self.assertEqual(status["total"], 1)
+        self.assertEqual(status["total"], 2)
+        self.assertEqual(status["processed"], 2)
         self.assertEqual(status["embedded"], 1)
+        self.assertEqual(status["skipped"], 1)
         self.assertEqual(status["failed"], 0)
-        self.assertEqual(FakeGemini.calls, 3)  # two upserts + one migration embedding
+        self.assertEqual(status["remaining"], 0)
+        self.assertEqual(status["percent"], 100.0)
+        self.assertEqual(FakeGemini.calls, 3)
 
     def test_start_is_non_blocking_and_idempotent_while_running(self):
         with patch("app.memory_migration._run") as runner:
