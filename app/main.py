@@ -15,9 +15,7 @@ worker = TaskWorker()
 
 @asynccontextmanager
 async def lifespan(app):
-    worker.start()
-    yield
-    worker.stop()
+    worker.start(); yield; worker.stop()
 
 app = FastAPI(title="JARVIS V0.4", version="0.4.0", lifespan=lifespan)
 STATIC = BASE_DIR / "web"
@@ -91,7 +89,8 @@ def conversation_message(conversation_id: str, payload: dict):
     if not content or len(content) > 20000: raise HTTPException(400, "content is required and must be <= 20000 characters")
     add_message(conversation_id, "user", content)
     history = conversation_history(conversation_id, 40)
-    prompt = "Answer the user using conversation history, task history, and relevant long-term memory. Never invent actions or facts.\n\nLONG-TERM MEMORY:\n" + memory_context(content) + "\n\nTASK HISTORY:\n" + "\n".join(str(x) for x in task_history(8)) + "\n\nCONVERSATION:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history)
+    ranked = memory_context(content, limit=12, scope="conversation", scope_id=conversation_id)
+    prompt = "Answer the user using conversation history, task history, and ranked long-term memory. Never invent actions or facts. Memory scores reflect relevance, scope, recency, confidence, and semantic similarity; use higher-ranked memories first and verify volatile facts.\n\nRANKED LONG-TERM MEMORY:\n" + ranked + "\n\nTASK HISTORY:\n" + "\n".join(str(x) for x in task_history(8)) + "\n\nCONVERSATION:\n" + "\n".join(f"{m['role']}: {m['content']}" for m in history)
     answer = Gemini().json(prompt, "You are JARVIS. Return JSON: {\"answer\":\"...\"}").get("answer", "")
     add_message(conversation_id, "assistant", answer)
     extract_memories(f"User: {content}\nAssistant: {answer}", scope="global", source_type="conversation", source_id=conversation_id)
