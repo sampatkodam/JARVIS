@@ -54,7 +54,7 @@ def mark_retry(task_id: str, error: str):
     with connect() as conn:
         row = conn.execute("SELECT retry_count,status FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row or row["status"] != "running":
-            return
+            return False
         retries = int(row["retry_count"] or 0) + 1
         if retries <= MAX_RETRIES:
             delay = min(60, 2 ** retries)
@@ -69,6 +69,17 @@ def mark_retry(task_id: str, error: str):
             level = "error"
     if message:
         log_task(task_id, message, level)
+    return retries > MAX_RETRIES
+
+
+def maybe_extract_terminal_memory(task_id):
+    with connect() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row and row["status"] in ("completed", "failed"):
+        try:
+            extract_task_memory(task_id)
+        except Exception as exc:
+            log_task(task_id, f"Memory extraction skipped: {exc}", "warning")
 
 
 def worker_loop(stop: Event):
@@ -79,12 +90,11 @@ def worker_loop(stop: Event):
             continue
         try:
             execute_task(task_id)
-            with connect() as conn:
-                status = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
-            if status and status["status"] in ("completed", "failed"):
-                extract_task_memory(task_id)
+            maybe_extract_terminal_memory(task_id)
         except Exception as exc:
-            mark_retry(task_id, str(exc))
+            terminal = mark_retry(task_id, str(exc))
+            if terminal:
+                maybe_extract_terminal_memory(task_id)
 
 
 class TaskWorker:
