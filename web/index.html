@@ -1,8 +1,8 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JARVIS V0.3.1</title><link rel="stylesheet" href="/static/style.css"></head>
-<body><main><header><div><div class="eyebrow">PERSONAL AUTONOMOUS AGENT</div><h1>JARVIS <span>V0.3.1</span></h1></div><div id="health" class="pill">checking…</div></header>
-<section class="composer"><label for="goal">Give JARVIS a goal</label><textarea id="goal" placeholder="Example: Inspect the workspace and identify what needs attention most."></textarea>
-<button onclick="createAndRun()">Run autonomously</button></section>
+<title>JARVIS V0.4</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main><header><div><div class="eyebrow">PERSONAL AUTONOMOUS AGENT</div><h1>JARVIS <span>V0.4</span></h1></div><div id="health" class="pill">checking…</div></header>
+<section class="composer"><label for="goal">Give JARVIS a goal</label><textarea id="goal" placeholder="Example: Inspect the workspace and identify what needs attention most."></textarea><button onclick="createAndRun()">Run autonomously</button></section>
+<section class="memory-panel"><div class="section-head"><h2>Persistent Memory</h2><div class="actions"><button class="secondary" onclick="newConversation()">New conversation</button><button class="secondary" onclick="extractWorkspace()">Learn workspace</button></div></div><div class="memory-chat"><div id="chat" class="chat"></div><div class="chat-row"><input id="memoryQuery" placeholder="Ask JARVIS from memory…" onkeydown="if(event.key==='Enter')sendMessage()"><button onclick="sendMessage()">Send</button></div></div><div class="search-row"><input id="search" placeholder="Search stored memory"><button class="secondary" onclick="searchMemory()">Search</button></div><div id="memoryResults" class="memory-results"></div></section>
 <section><div class="section-head"><h2>Tasks</h2><button class="secondary" onclick="loadTasks()">Refresh</button></div><div id="tasks"></div></section>
 </main><script src="/static/app.js"></script></body></html>
