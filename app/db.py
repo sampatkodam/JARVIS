@@ -33,13 +33,8 @@ CREATE TABLE IF NOT EXISTS steps (
 '''
 
 
-def connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+def _prepare(conn):
     conn.executescript(SCHEMA)
-    # V0.2 migration for databases created by V0.1.
     columns = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
     for name, definition in (
         ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -48,13 +43,16 @@ def connect():
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
-    return conn
 
 
 @contextmanager
-def transaction():
-    conn = connect()
+def connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
+        _prepare(conn)
         yield conn
         conn.commit()
     finally:
