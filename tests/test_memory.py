@@ -11,6 +11,10 @@ class FakeGemini:
     def json(self, prompt, system=""):
         return {"memories": [{"kind": "preference", "key": "editor", "content": "Use a lightweight editor.", "confidence": 0.9}]}
 
+    def embed(self, text):
+        text = text.lower()
+        return [1.0, 0.0] if "database" in text or "sqlite" in text else [0.0, 1.0]
+
 
 class MemoryTests(unittest.TestCase):
     def setUp(self):
@@ -23,12 +27,32 @@ class MemoryTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_memory_is_persistent_and_searchable(self):
-        memory_id = upsert_memory("project", "auri", "decision", "database", "Use SQLite for durable local state.")
-        self.assertIsNotNone(memory_id)
-        rows = search_memories("durable SQLite state")
+        with patch("app.memory.Gemini", FakeGemini):
+            memory_id = upsert_memory("project", "auri", "decision", "database", "Use SQLite for durable local state.")
+            self.assertIsNotNone(memory_id)
+            rows = search_memories("durable SQLite state")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["scope"], "project")
         self.assertEqual(rows[0]["scope_id"], "auri")
+        self.assertIn("relevance_score", rows[0])
+        self.assertIn("semantic_similarity", rows[0])
+
+    def test_semantic_similarity_can_rank_without_exact_keyword_overlap(self):
+        with patch("app.memory.Gemini", FakeGemini):
+            upsert_memory("global", None, "fact", "storage", "SQLite keeps durable application state.")
+            upsert_memory("global", None, "fact", "editor", "Use a lightweight editor for coding.")
+            rows = search_memories("database")
+        self.assertEqual(rows[0]["key"], "storage")
+        self.assertGreater(rows[0]["semantic_similarity"], 0.5)
+
+    def test_confidence_and_scope_are_part_of_ranked_result(self):
+        with patch("app.memory.Gemini", FakeGemini):
+            upsert_memory("global", None, "fact", "database-global", "SQLite database state.", confidence=0.3)
+            upsert_memory("project", "p1", "decision", "database-project", "SQLite database state.", confidence=0.9)
+            rows = search_memories("database", scope="project", scope_id="p1")
+        self.assertEqual(rows[0]["key"], "database-project")
+        self.assertGreater(rows[0]["scope_score"], rows[1]["scope_score"])
+        self.assertGreater(rows[0]["relevance_score"], rows[1]["relevance_score"])
 
     def test_conversation_history_round_trips(self):
         add_message("conv-1", "user", "Remember that the project uses SQLite.")
