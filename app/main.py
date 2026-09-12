@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -64,7 +65,7 @@ def run(task_id: str):
         conn.execute(
             """UPDATE tasks SET status='waiting', next_run_at=NULL, error=NULL, updated_at=?
                WHERE id=? AND status IN ('failed','cancelled')""",
-            (__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(), task_id),
+            (datetime.now(timezone.utc).isoformat(), task_id),
         )
     return RunResponse(task_id=task_id, status="waiting", message="Task queued for background execution.")
 
