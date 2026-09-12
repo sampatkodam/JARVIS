@@ -10,8 +10,10 @@ Work toward the user's goal using available tools. Never invent tool results.
 Prefer small, reversible steps. Do not claim completion until verification supports it.
 Return JSON only when requested."""
 
+
 def now():
     return datetime.now(timezone.utc).isoformat()
+
 
 def create_task(goal: str) -> str:
     task_id = str(uuid.uuid4())
@@ -19,8 +21,10 @@ def create_task(goal: str) -> str:
     with connect() as conn:
         conn.execute(
             "INSERT INTO tasks(id, goal, status, created_at, updated_at) VALUES(?,?,?,?,?)",
-            (task_id, goal, "queued", ts, ts))
+            (task_id, goal, "waiting", ts, ts),
+        )
     return task_id
+
 
 def get_task(task_id: str):
     with connect() as conn:
@@ -28,13 +32,19 @@ def get_task(task_id: str):
         if not task:
             return None
         steps = conn.execute(
-            "SELECT * FROM steps WHERE task_id=? ORDER BY step_no", (task_id,)).fetchall()
+            "SELECT * FROM steps WHERE task_id=? ORDER BY step_no", (task_id,)
+        ).fetchall()
         return {"task": dict(task), "steps": [dict(s) for s in steps]}
+
 
 def cancel_task(task_id: str):
     with connect() as conn:
-        conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?",
-                     ("cancelled", now(), task_id))
+        conn.execute(
+            """UPDATE tasks SET status='cancelled', updated_at=?
+               WHERE id=? AND status IN ('waiting','retrying','running')""",
+            (now(), task_id),
+        )
+
 
 def plan(gemini, goal, recovery=""):
     prompt = f"""Create an executable plan for this goal:
@@ -46,8 +56,9 @@ Available tools:
 Return exactly:
 {{"steps":[{{"description":"...", "tool_name":"exact tool name", "tool_args":{{}}}}]}}
 
-Use at most 6 steps. {("Recovery context: " + recovery) if recovery else ""}"""
+Use at most 6 steps. {('Recovery context: ' + recovery) if recovery else ''}"""
     return gemini.json(prompt, SYSTEM).get("steps", [])
+
 
 def critique(gemini, goal, step, output):
     prompt = f"""Evaluate whether this step succeeded in service of the goal.
@@ -60,7 +71,9 @@ Return:
 {{"passed":true/false,"critique":"short explanation"}}"""
     return gemini.json(prompt, SYSTEM)
 
-def run_task(task_id: str):
+
+def execute_task(task_id: str):
+    """Execute one claimed queue item. The worker owns the running transition."""
     record = get_task(task_id)
     if not record:
         raise ValueError("Task not found.")
@@ -69,13 +82,14 @@ def run_task(task_id: str):
 
     gemini = Gemini()
     goal = record["task"]["goal"]
-    with connect() as conn:
-        conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?",
-                     ("running", now(), task_id))
-
     recovery = ""
     try:
         for _ in range(12):
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE tasks SET worker_heartbeat_at=?, updated_at=? WHERE id=?",
+                    (now(), now(), task_id),
+                )
             existing = get_task(task_id)["steps"]
             passed = {s["description"] for s in existing if s["status"] == "passed"}
             steps = plan(gemini, goal, recovery)
@@ -84,9 +98,10 @@ def run_task(task_id: str):
             if not selected:
                 with connect() as conn:
                     conn.execute(
-                        "UPDATE tasks SET status=?, result=?, updated_at=? WHERE id=?",
-                        ("completed", "Goal completed and verified by the execution loop.",
-                         now(), task_id))
+                        """UPDATE tasks SET status='completed', result=?, error=NULL,
+                           next_run_at=NULL, worker_heartbeat_at=NULL, updated_at=? WHERE id=?""",
+                        ("Goal completed and verified by the execution loop.", now(), task_id),
+                    )
                 return
 
             action = selected.get("tool_name")
@@ -102,22 +117,22 @@ def run_task(task_id: str):
             result = critique(gemini, goal, selected, output)
             status = "passed" if result.get("passed") else "failed"
             step_no = len(existing) + 1
-
             with connect() as conn:
                 conn.execute(
                     """INSERT INTO steps
                     (task_id,step_no,action,description,status,tool_name,tool_args,output,critique,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (task_id, step_no, action or "reason",
-                     selected.get("description",""), status, action,
-                     json.dumps(args), json.dumps(output)[:20000],
-                     json.dumps(result)[:10000], now(), now()))
-
+                    (task_id, step_no, action or "reason", selected.get("description", ""),
+                     status, action, json.dumps(args), json.dumps(output)[:20000],
+                     json.dumps(result)[:10000], now(), now()),
+                )
             recovery = "" if status == "passed" else result.get("critique", "Step failed.")
 
         raise RuntimeError("Maximum autonomous execution cycles reached.")
     except Exception as exc:
         with connect() as conn:
-            conn.execute("UPDATE tasks SET status=?, error=?, updated_at=? WHERE id=?",
-                         ("failed", str(exc), now(), task_id))
+            conn.execute(
+                "UPDATE tasks SET status='failed', error=?, worker_heartbeat_at=NULL, updated_at=? WHERE id=?",
+                (str(exc), now(), task_id),
+            )
         raise
