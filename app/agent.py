@@ -3,11 +3,13 @@ import uuid
 from datetime import datetime, timezone
 from app.db import connect
 from app.gemini import Gemini
+from app.memory import memory_context
 from app.tools.registry import TOOLS, TOOL_DESCRIPTIONS
 
 SYSTEM = """You are JARVIS, an autonomous personal software agent.
 Work toward the user's goal using available tools. Never invent tool results.
 Prefer small, reversible steps. Do not claim completion until verification supports it.
+Treat supplied memory as context, not as proof of current state; verify anything that may have changed.
 Return JSON only when requested."""
 
 
@@ -170,9 +172,12 @@ def checkpoint(task_id: str):
     return "running"
 
 
-def plan(gemini, goal, recovery=""):
+def plan(gemini, goal, recovery="", memory=""):
     prompt = f"""Create an executable plan for this goal:
 {goal}
+
+Relevant ranked long-term memory:
+{memory or 'No relevant long-term memory.'}
 
 Available tools:
 {json.dumps(list(TOOL_DESCRIPTIONS.keys()))}
@@ -180,7 +185,7 @@ Available tools:
 Return exactly:
 {{"steps":[{{"description":"...", "tool_name":"exact tool name", "tool_args":{{}}}}]}}
 
-Use at most 6 steps. {('Recovery context: ' + recovery) if recovery else ''}"""
+Use at most 6 steps. Treat memory as contextual guidance, not proof of current state. Verify anything that may have changed. {('Recovery context: ' + recovery) if recovery else ''}"""
     return gemini.json(prompt, SYSTEM).get("steps", [])
 
 
@@ -224,7 +229,8 @@ def execute_task(task_id: str):
             existing = get_task(task_id)["steps"]
             passed = {s["description"] for s in existing if s["status"] == "passed"}
             log_task(task_id, f"Planning cycle {cycle}.")
-            steps = plan(gemini, goal, recovery)
+            ranked_memory = memory_context(goal, limit=12, scope="project", scope_id=task_id)
+            steps = plan(gemini, goal, recovery, ranked_memory)
             state = checkpoint(task_id)
             if state != "running":
                 return
