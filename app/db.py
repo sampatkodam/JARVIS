@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS memories (
     source_type TEXT NOT NULL DEFAULT 'manual',
     source_id TEXT,
     confidence REAL NOT NULL DEFAULT 1.0,
+    embedding BLOB,
+    embedding_model TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(scope, scope_id, kind, key)
@@ -90,6 +92,10 @@ def _prepare(conn):
     for name, definition in (("retry_count", "INTEGER NOT NULL DEFAULT 0"), ("next_run_at", "TEXT"), ("worker_heartbeat_at", "TEXT"), ("pause_requested", "INTEGER NOT NULL DEFAULT 0"), ("cancel_requested", "INTEGER NOT NULL DEFAULT 0")):
         if name not in columns:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
+    memory_columns = {r["name"] for r in conn.execute("PRAGMA table_info(memories)").fetchall()}
+    for name, definition in (("embedding", "BLOB"), ("embedding_model", "TEXT")):
+        if name not in memory_columns:
+            conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
 
 
 @contextmanager
