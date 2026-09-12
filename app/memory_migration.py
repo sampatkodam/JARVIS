@@ -2,12 +2,10 @@ import json
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
 
-from app.config import DB_PATH
 from app.db import connect
 from app.gemini import Gemini
 
 EMBEDDING_MODEL = "gemini-embedding-001"
-BATCH_SIZE = 5
 POLL_SECONDS = 0.05
 
 _state_lock = Lock()
@@ -19,11 +17,18 @@ _stop = Event()
 def _now(): return datetime.now(timezone.utc).isoformat()
 
 
+def _set_status(status=None, **updates):
+    with _state_lock:
+        if status is not None: _state["status"] = status
+        _state.update(updates)
+        _state["updated_at"] = _now()
+
+
 def _reset_state(total):
-    global _state
     ts = _now()
     with _state_lock:
         _state = {"status": "running", "total": total, "processed": 0, "embedded": 0, "skipped": 0, "failed": 0, "last_error": None, "started_at": ts, "updated_at": ts}
+        globals()["_state"] = _state
 
 
 def migration_status():
@@ -34,9 +39,9 @@ def migration_status():
     return state
 
 
-def _pending_ids():
+def _memory_ids():
     with connect() as conn:
-        rows = conn.execute("SELECT id FROM memories WHERE embedding IS NULL OR embedding_model != ? ORDER BY id ASC", (EMBEDDING_MODEL,)).fetchall()
+        rows = conn.execute("SELECT id FROM memories ORDER BY id ASC").fetchall()
     return [r["id"] for r in rows]
 
 
@@ -53,35 +58,36 @@ def _save_embedding(memory_id, values):
 
 def _run():
     try:
-        ids = _pending_ids()
+        ids = _memory_ids()
         _reset_state(len(ids))
+        if not ids:
+            _set_status("completed")
+            return
         gemini = Gemini()
         for memory_id in ids:
             if _stop.is_set():
-                with _state_lock: _state["status"] = "stopped"; _state["updated_at"] = _now()
+                _set_status("stopped")
                 return
             row = _fetch_memory(memory_id)
             if not row:
-                with _state_lock: _state["processed"] += 1; _state["skipped"] += 1; _state["updated_at"] = _now()
+                _set_status(processed=_state["processed"] + 1, skipped=_state["skipped"] + 1)
                 continue
             if row["embedding"] and row["embedding_model"] == EMBEDDING_MODEL:
-                with _state_lock: _state["processed"] += 1; _state["skipped"] += 1; _state["updated_at"] = _now()
+                _set_status(processed=_state["processed"] + 1, skipped=_state["skipped"] + 1)
                 continue
             try:
                 values = gemini.embed(f"{row['kind']}: {row['key']}\n{row['content']}")
                 saved = _save_embedding(memory_id, values) if values else 0
-                with _state_lock:
-                    _state["processed"] += 1
-                    _state["embedded"] += 1 if saved else 0
-                    _state["skipped"] += 1 if not saved else 0
-                    _state["updated_at"] = _now()
+                if saved:
+                    _set_status(processed=_state["processed"] + 1, embedded=_state["embedded"] + 1)
+                else:
+                    _set_status(processed=_state["processed"] + 1, skipped=_state["skipped"] + 1)
             except Exception as exc:
-                with _state_lock:
-                    _state["processed"] += 1; _state["failed"] += 1; _state["last_error"] = str(exc)[:500]; _state["updated_at"] = _now()
+                _set_status(processed=_state["processed"] + 1, failed=_state["failed"] + 1, last_error=str(exc)[:500])
             _stop.wait(POLL_SECONDS)
-        with _state_lock: _state["status"] = "completed"; _state["updated_at"] = _now()
+        _set_status("completed")
     except Exception as exc:
-        with _state_lock: _state["status"] = "failed"; _state["last_error"] = str(exc)[:500]; _state["updated_at"] = _now()
+        _set_status("failed", last_error=str(exc)[:500])
 
 
 def start_embedding_migration():
