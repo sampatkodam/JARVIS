@@ -19,7 +19,7 @@ async def lifespan(app):
     worker.stop()
 
 
-app = FastAPI(title="JARVIS V0.3", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="JARVIS V0.3.1", version="0.3.1", lifespan=lifespan)
 STATIC = BASE_DIR / "web"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -32,7 +32,7 @@ def index():
 @app.get("/api/health")
 def health():
     alive = bool(worker.thread and worker.thread.is_alive())
-    return {"status": "ok", "service": "jarvis", "version": "0.3.0", "worker": "running" if alive else "stopped"}
+    return {"status": "ok", "service": "jarvis", "version": "0.3.1", "worker": "running" if alive else "stopped"}
 
 
 @app.get("/api/tasks")
