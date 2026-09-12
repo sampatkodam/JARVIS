@@ -1,17 +1,20 @@
-# JARVIS V0.1
+# JARVIS V0.2
 
-Lightweight, cloud-first autonomous personal agent baseline.
+Lightweight, cloud-first autonomous personal agent with a persistent background task queue.
 
-Included:
+## Included
 - FastAPI backend
-- SQLite persistent task state
+- SQLite persistent task and step state
+- Persistent background task queue
+- Task states: `waiting`, `running`, `retrying`, `failed`, `completed` (plus `cancelled`)
+- Background worker started with the FastAPI application
+- Automatic retry with bounded exponential backoff (up to 3 retries)
 - Gemini API via official `google-genai` SDK
 - Workspace-scoped filesystem tools
 - Shell tool with timeout/output limits
 - Git tools
 - Planner -> Executor -> Critic loop
-- Persistent task/step state
-- Basic web UI
+- Live task-status updates in the web UI
 - No local LLM/Ollama required
 
 ## Requirements
@@ -31,6 +34,8 @@ uvicorn app.main:app --reload
 ```
 
 Open http://127.0.0.1:8000
+
+The worker starts automatically with FastAPI. Creating a task puts it in `waiting`; the worker claims it and changes it to `running`. Transient execution failures move the task to `retrying`, then back to `waiting` when the backoff expires. After the retry limit, the task becomes `failed`.
 
 ## Run (macOS/Linux)
 ```bash
@@ -52,21 +57,25 @@ Optional:
 - `JARVIS_COMMAND_TIMEOUT`
 - `JARVIS_MAX_OUTPUT_CHARS`
 
+## Queue behavior
+1. API creates a task in `waiting`.
+2. The worker atomically claims one eligible task and marks it `running`.
+3. The existing planner/executor/critic loop runs in the worker.
+4. Successful execution ends in `completed`.
+5. Worker exceptions enter `retrying` with a bounded backoff.
+6. After 3 retries the task becomes `failed`.
+7. Task metadata, retry count, next-run time, heartbeat, and step history survive process restarts because they are stored in SQLite.
+8. The web UI polls task state and worker health every 2 seconds.
+
 ## API
-- `GET /api/health`
-- `GET /api/tasks`
-- `POST /api/tasks`
-- `GET /api/tasks/{task_id}`
-- `POST /api/tasks/{task_id}/run`
-- `POST /api/tasks/{task_id}/cancel`
+- `GET /api/health` — service and worker status
+- `GET /api/tasks` — queue/task list
+- `POST /api/tasks` — enqueue a new task
+- `GET /api/tasks/{task_id}` — task and step status
+- `POST /api/tasks/{task_id}/run` — requeue a failed/cancelled task
+- `POST /api/tasks/{task_id}/cancel` — cancel a queued/retrying/running task
 
 ## Autonomy
-Each task uses:
-1. Planner creates a small executable plan.
-2. Executor performs a step.
-3. Critic evaluates it.
-4. Failed steps trigger replanning/recovery.
-5. State is persisted after transitions.
-6. The loop stops only on verified completion, cancellation, or a hard execution limit.
+JARVIS retains the V0.1 planner -> executor -> critic loop. V0.2 moves execution out of the HTTP request path and into a persistent SQLite-backed worker queue, so the browser/API request can return immediately while the task continues in the background.
 
-V0.1 is a development baseline. Its shell safety policy is intentionally conservative but is not a production-grade sandbox.
+V0.2 is still a development baseline. Its shell safety policy is intentionally conservative but is not a production-grade sandbox.
