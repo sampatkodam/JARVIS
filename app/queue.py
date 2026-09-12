@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from threading import Event, Thread
 
-from app.agent import execute_task
+from app.agent import execute_task, log_task
 from app.db import connect
 
 POLL_INTERVAL_SECONDS = 1.0
@@ -16,19 +16,22 @@ def now():
 def recover_stale_tasks():
     """Return interrupted running tasks to the durable queue after a restart/crash."""
     with connect() as conn:
-        conn.execute(
-            """UPDATE tasks
-               SET status='waiting', next_run_at=NULL, worker_heartbeat_at=NULL,
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status='running' AND (worker_heartbeat_at IS NULL OR worker_heartbeat_at < datetime('now', ?))",
+            (f"-{RECOVER_AFTER_SECONDS} seconds",),
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            conn.execute(
+                """UPDATE tasks SET status='waiting', next_run_at=NULL, worker_heartbeat_at=NULL,
                    error=COALESCE(error, 'Recovered after worker interruption.'), updated_at=?
-               WHERE status='running'
-                 AND (worker_heartbeat_at IS NULL
-                      OR worker_heartbeat_at < datetime('now', ?))""",
-            (now(), f"-{RECOVER_AFTER_SECONDS} seconds"),
-        )
+                   WHERE id=?""",
+                (now(), task_id),
+            )
+            log_task(task_id, "Recovered stale task after worker restart.", "warning")
 
 
 def claim_next_task():
-    """Atomically claim one waiting/retrying task so multiple workers do not own it."""
     with connect() as conn:
         row = conn.execute(
             """SELECT id FROM tasks
@@ -41,11 +44,12 @@ def claim_next_task():
             return None
         task_id = row["id"]
         updated = conn.execute(
-            """UPDATE tasks
-               SET status='running', updated_at=?, worker_heartbeat_at=?
+            """UPDATE tasks SET status='running', updated_at=?, worker_heartbeat_at=?
                WHERE id=? AND status IN ('waiting', 'retrying')""",
             (now(), now(), task_id),
         ).rowcount
+        if updated:
+            log_task(task_id, "Task claimed by worker.")
         return task_id if updated else None
 
 
@@ -56,19 +60,18 @@ def mark_retry(task_id: str, error: str):
         if retries <= MAX_RETRIES:
             delay = min(60, 2 ** retries)
             conn.execute(
-                """UPDATE tasks
-                   SET status='retrying', retry_count=?, next_run_at=datetime('now', ?),
-                       error=?, worker_heartbeat_at=NULL, updated_at=?
-                   WHERE id=?""",
+                """UPDATE tasks SET status='retrying', retry_count=?, next_run_at=datetime('now', ?),
+                   error=?, worker_heartbeat_at=NULL, updated_at=? WHERE id=?""",
                 (retries, f"+{delay} seconds", error, now(), task_id),
             )
+            log_task(task_id, f"Retry {retries}/{MAX_RETRIES} scheduled in {delay}s: {error}", "warning")
         else:
             conn.execute(
-                """UPDATE tasks
-                   SET status='failed', retry_count=?, error=?, worker_heartbeat_at=NULL, updated_at=?
+                """UPDATE tasks SET status='failed', retry_count=?, error=?, worker_heartbeat_at=NULL, updated_at=?
                    WHERE id=?""",
                 (retries, error, now(), task_id),
             )
+            log_task(task_id, f"Retry limit reached; task failed: {error}", "error")
 
 
 def worker_loop(stop: Event):
