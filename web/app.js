@@ -4,7 +4,10 @@ async function api(url, options = {}) {
 }
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
-const LABELS = {waiting:"WAITING", running:"RUNNING", retrying:"RETRYING", failed:"FAILED", completed:"COMPLETED", cancelled:"CANCELLED"};
+const LABELS = {
+  waiting:"WAITING", running:"RUNNING", retrying:"RETRYING", paused:"PAUSED",
+  pausing:"PAUSING", cancelling:"CANCELLING", failed:"FAILED", completed:"COMPLETED", cancelled:"CANCELLED"
+};
 const logCursors = {};
 
 async function health() {
@@ -22,6 +25,8 @@ async function createAndRun() {
 }
 
 async function runTask(id) { await api(`/api/tasks/${id}/run`, {method:"POST"}); loadTasks(); }
+async function pauseTask(id) { await api(`/api/tasks/${id}/pause`, {method:"POST"}); loadTasks(); }
+async function resumeTask(id) { await api(`/api/tasks/${id}/resume`, {method:"POST"}); loadTasks(); }
 async function cancelTask(id) { await api(`/api/tasks/${id}/cancel`, {method:"POST"}); loadTasks(); }
 
 async function loadLogs(id) {
@@ -40,15 +45,35 @@ async function loadLogs(id) {
   target.scrollTop = target.scrollHeight;
 }
 
+function controlsFor(t) {
+  if (t.status === "waiting" || t.status === "retrying") {
+    return `<button class="pause" onclick="pauseTask('${t.id}')">Pause</button><button class="danger" onclick="cancelTask('${t.id}')">Cancel</button>`;
+  }
+  if (t.status === "running") {
+    return `<button class="pause" onclick="pauseTask('${t.id}')">Pause</button><button class="danger" onclick="cancelTask('${t.id}')">Cancel</button>`;
+  }
+  if (t.status === "paused") {
+    return `<button class="run" onclick="resumeTask('${t.id}')">Resume</button><button class="danger" onclick="cancelTask('${t.id}')">Cancel</button>`;
+  }
+  if (t.status === "pausing") {
+    return `<button class="pause" disabled>Pausing…</button><button class="danger" onclick="cancelTask('${t.id}')">Cancel</button>`;
+  }
+  if (t.status === "cancelling") {
+    return `<button class="danger" disabled>Cancelling…</button>`;
+  }
+  if (t.status === "failed" || t.status === "cancelled") {
+    return `<button class="run" onclick="runTask('${t.id}')">Queue again</button>`;
+  }
+  return "";
+}
+
 async function loadTasks() {
   const tasks = await api("/api/tasks");
   const box = document.getElementById("tasks");
   if (!tasks.length) { box.innerHTML = '<p class="muted">No tasks yet.</p>'; return; }
   box.innerHTML = tasks.map(t => {
     const retry = t.retry_count ? `<span class="muted">retry ${esc(t.retry_count)}</span>` : "";
-    const action = TERMINAL.has(t.status)
-      ? (t.status === "failed" || t.status === "cancelled" ? `<button class="run" onclick="runTask('${t.id}')">Queue again</button>` : "")
-      : `<button class="run" onclick="cancelTask('${t.id}')">Cancel</button>`;
+    const action = controlsFor(t);
     return `<article class="task">
       <div class="task-top"><div class="status status-${esc(t.status)}">${esc(LABELS[t.status] || t.status)}</div><div class="actions">${retry}${action}</div></div>
       <div class="goal">${esc(t.goal)}</div>
