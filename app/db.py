@@ -39,21 +39,55 @@ CREATE TABLE IF NOT EXISTS task_logs (
     message TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_task_logs_task_created
-    ON task_logs(task_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_task_logs_task_created ON task_logs(task_id, created_at, id);
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    task_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at, id);
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,
+    scope_id TEXT,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    content TEXT NOT NULL,
+    source_type TEXT NOT NULL DEFAULT 'manual',
+    source_id TEXT,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(scope, scope_id, kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, scope_id, updated_at);
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, key, kind, scope, scope_id, content='memories', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memory_fts(rowid, content, key, kind, scope, scope_id) VALUES(new.id, new.content, new.key, new.kind, new.scope, new.scope_id);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, content, key, kind, scope, scope_id) VALUES('delete', old.id, old.content, old.key, old.kind, old.scope, old.scope_id);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, content, key, kind, scope, scope_id) VALUES('delete', old.id, old.content, old.key, old.kind, old.scope, old.scope_id);
+    INSERT INTO memory_fts(rowid, content, key, kind, scope, scope_id) VALUES(new.id, new.content, new.key, new.kind, new.scope, new.scope_id);
+END;
 '''
 
 
 def _prepare(conn):
     conn.executescript(SCHEMA)
     columns = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-    for name, definition in (
-        ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
-        ("next_run_at", "TEXT"),
-        ("worker_heartbeat_at", "TEXT"),
-        ("pause_requested", "INTEGER NOT NULL DEFAULT 0"),
-        ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
-    ):
+    for name, definition in (("retry_count", "INTEGER NOT NULL DEFAULT 0"), ("next_run_at", "TEXT"), ("worker_heartbeat_at", "TEXT"), ("pause_requested", "INTEGER NOT NULL DEFAULT 0"), ("cancel_requested", "INTEGER NOT NULL DEFAULT 0")):
         if name not in columns:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
 
