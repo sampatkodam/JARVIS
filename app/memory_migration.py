@@ -26,8 +26,11 @@ def _stale(heartbeat):
     if not heartbeat:
         return True
     try:
-        return datetime.fromisoformat(heartbeat) < datetime.now(timezone.utc) - timedelta(seconds=LEASE_SECONDS)
-    except ValueError:
+        parsed = datetime.fromisoformat(heartbeat)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed < datetime.now(timezone.utc) - timedelta(seconds=LEASE_SECONDS)
+    except (TypeError, ValueError):
         return True
 
 
@@ -159,6 +162,20 @@ def start_embedding_migration():
     status = migration_status()
     if status["status"] == "failed":
         _claim_job(reset=True)
+    _thread = Thread(target=_run, daemon=True, name="jarvis-memory-embedding-migration")
+    _thread.start()
+    return migration_status()
+
+
+def resume_embedding_migration():
+    global _thread
+    status = migration_status()
+    if status["status"] not in {"running", "stopped", "stale"}:
+        return status
+    with _state_lock:
+        if _thread and _thread.is_alive():
+            return migration_status()
+    _stop.clear()
     _thread = Thread(target=_run, daemon=True, name="jarvis-memory-embedding-migration")
     _thread.start()
     return migration_status()
