@@ -34,12 +34,7 @@ def _stale(heartbeat):
 def _db_state():
     with connect() as conn:
         row = conn.execute("SELECT * FROM embedding_migration_jobs WHERE id=1").fetchone()
-    if not row:
-        return None
-    state = dict(row)
-    if state.get("status") == "running" and _stale(state.get("heartbeat_at")):
-        state["status"] = "stale"
-    return state
+    return dict(row) if row else None
 
 
 def migration_status():
@@ -50,6 +45,8 @@ def migration_status():
     else:
         with _state_lock:
             _state.update(state)
+    if state.get("status") == "running" and _stale(state.get("heartbeat_at")):
+        state["status"] = "stale"
     state["remaining"] = max(0, state["total"] - state["processed"])
     state["percent"] = round((state["processed"] / state["total"]) * 100, 1) if state["total"] else 100.0
     state["resumable"] = state["status"] in {"stopped", "stale", "failed", "idle"}
@@ -67,7 +64,7 @@ def _set_db(updates):
         _state.update(updates)
 
 
-def _create_or_claim_job():
+def _claim_job(reset=False):
     now = _now()
     lease = (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).isoformat()
     with connect() as conn:
@@ -75,10 +72,13 @@ def _create_or_claim_job():
         if row and row["status"] == "running" and not _stale(row["heartbeat_at"]):
             return False
         total = conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"]
-        if not row:
-            conn.execute("INSERT INTO embedding_migration_jobs (id,status,total,updated_at,started_at,worker_id,heartbeat_at) VALUES (1,'running',?,?,?,?,?)", (total, now, now, _WORKER_ID, lease))
+        if reset or not row or row["status"] in {"completed", "failed", "idle"}:
+            if row:
+                conn.execute("UPDATE embedding_migration_jobs SET status='running', total=?, processed=0, embedded=0, skipped=0, failed=0, last_memory_id=0, last_error=NULL, worker_id=?, heartbeat_at=?, started_at=?, updated_at=? WHERE id=1", (total, _WORKER_ID, lease, now, now))
+            else:
+                conn.execute("INSERT INTO embedding_migration_jobs (id,status,total,processed,embedded,skipped,failed,last_memory_id,last_error,worker_id,heartbeat_at,started_at,updated_at) VALUES (1,'running',?,?,?,?,?,?,?,?,?,?,?)", (total, 0, 0, 0, 0, 0, None, _WORKER_ID, lease, now, now))
         else:
-            conn.execute("UPDATE embedding_migration_jobs SET status='running', total=?, worker_id=?, heartbeat_at=?, started_at=COALESCE(started_at,?), last_error=NULL, updated_at=? WHERE id=1", (total, _WORKER_ID, lease, now, now))
+            conn.execute("UPDATE embedding_migration_jobs SET status='running', total=?, worker_id=?, heartbeat_at=?, updated_at=? WHERE id=1", (total, _WORKER_ID, lease, now))
     return True
 
 
@@ -90,12 +90,18 @@ def _claim_lease():
 
 
 def _advance(memory_id, **counts):
-    updates = {"last_memory_id": memory_id}
-    current = _db_state() or {}
-    for key, value in counts.items():
-        updates[key] = int(current.get(key, 0)) + value
-    updates["heartbeat_at"] = (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).isoformat()
-    _set_db(updates)
+    with connect() as conn:
+        row = conn.execute("SELECT processed,embedded,skipped,failed FROM embedding_migration_jobs WHERE id=1 AND worker_id=?", (_WORKER_ID,)).fetchone()
+        if not row:
+            return
+        updates = {"last_memory_id": memory_id, "heartbeat_at": (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).isoformat()}
+        for key, value in counts.items():
+            updates[key] = row[key] + value
+        assignments = ", ".join(f"{key}=?" for key in updates)
+        conn.execute(f"UPDATE embedding_migration_jobs SET {assignments}, processed=processed+? WHERE id=1 AND worker_id=?", (*updates.values(), counts.get("processed", 0), _WORKER_ID))
+    with _state_lock:
+        _state.update(updates)
+        _state["processed"] = row["processed"] + counts.get("processed", 0)
 
 
 def _memory_after(cursor):
@@ -111,7 +117,7 @@ def _save_embedding(memory_id, values):
 
 def _run():
     try:
-        if not _create_or_claim_job():
+        if not _claim_job():
             return
         gemini = Gemini()
         while True:
@@ -152,8 +158,8 @@ def start_embedding_migration():
         if _thread and _thread.is_alive():
             return migration_status()
     _stop.clear()
-    if not _create_or_claim_job():
-        return migration_status()
+    if migration_status()["status"] == "failed":
+        _claim_job(reset=True)
     _thread = Thread(target=_run, daemon=True, name="jarvis-memory-embedding-migration")
     _thread.start()
     return migration_status()
