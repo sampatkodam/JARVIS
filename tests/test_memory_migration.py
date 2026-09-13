@@ -56,6 +56,28 @@ class MemoryMigrationTests(unittest.TestCase):
         self.assertEqual(second["status"], first["status"])
         self.assertTrue(migration._thread is not None)
 
+    def test_stopped_job_resumes_from_persisted_cursor_after_restart(self):
+        with patch("app.memory_migration.Gemini", FakeGemini):
+            first = upsert_memory("global", None, "fact", "first", "First")
+            second = upsert_memory("global", None, "fact", "second", "Second")
+            with db.connect() as conn:
+                conn.execute("UPDATE memories SET embedding=NULL, embedding_model=NULL")
+                conn.execute("INSERT INTO embedding_migration_jobs (id,status,total,processed,embedded,skipped,failed,last_memory_id,started_at,updated_at) VALUES (1,'stopped',2,1,1,0,0,?,datetime('now'),datetime('now'))", (first,))
+            migration._run()
+        status = migration.migration_status()
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["processed"], 2)
+        self.assertEqual(status["embedded"], 2)
+        self.assertEqual(status["last_memory_id"], second)
+        self.assertEqual(FakeGemini.calls, 1)
+
+    def test_running_job_with_live_lease_is_not_claimed_twice(self):
+        with db.connect() as conn:
+            conn.execute("INSERT INTO embedding_migration_jobs (id,status,total,updated_at,heartbeat_at,worker_id) VALUES (1,'running',0,datetime('now'),datetime('now', '+30 seconds'),'another-worker')")
+        status = migration.start_embedding_migration()
+        self.assertEqual(status["status"], "running")
+        self.assertIsNone(migration._thread)
+
 
 if __name__ == "__main__":
     unittest.main()
