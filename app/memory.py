@@ -13,7 +13,7 @@ Return JSON only: {\"memories\":[{\"kind\":\"preference|fact|decision|constraint
 Prefer high-value facts that help future tasks. If nothing durable is present, return {\"memories\":[]}."""
 
 EMBEDDING_MODEL = "gemini-embedding-001"
-SCOPE_WEIGHTS = {"global": 0.92, "project": 1.0, "workspace": 0.95, "conversation": 0.88, "task": 0.82}
+SCOPE_WEIGHTS = {"task": 1.00, "project": 0.96, "workspace": 0.90, "conversation": 0.84, "global": 0.78}
 RECENCY_HALF_LIFE_DAYS = 30.0
 
 
@@ -39,7 +39,8 @@ def _cosine(a, b):
     if not a or not b or len(a) != len(b): return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a)); nb = math.sqrt(sum(y * y for y in b))
-    return max(0.0, min(1.0, (dot / (na * nb) + 1.0) / 2.0)) if na and nb else 0.0
+    if not na or not nb: return 0.0
+    return max(0.0, min(1.0, dot / (na * nb)))
 
 
 def _recency_score(updated_at):
@@ -50,8 +51,9 @@ def _recency_score(updated_at):
 
 def _lexical_score(query, row):
     q = set(re.findall(r"[a-z0-9_]+", str(query).lower()))
+    if not q: return 0.0
     text = set(re.findall(r"[a-z0-9_]+", f"{row['key']} {row['content']} {row['kind']}".lower()))
-    return len(q & text) / max(1, len(q))
+    return len(q & text) / len(q)
 
 
 def upsert_memory(scope, scope_id, kind, key, content, source_type="manual", source_id=None, confidence=1.0):
@@ -97,6 +99,15 @@ def _candidate_memories(query, scopes=None):
     return [dict(r) for r in rows]
 
 
+def _scope_score(row_scope, requested_scope=None, requested_scope_id=None, row_scope_id=None):
+    score=SCOPE_WEIGHTS.get(row_scope,0.70)
+    if requested_scope and row_scope == requested_scope:
+        score=1.0
+    if requested_scope_id is not None and row_scope_id == requested_scope_id:
+        score=1.0
+    return score
+
+
 def _rank_memories(query, rows, limit=20, scope=None, scope_id=None):
     if not rows: return []
     query_embedding=None
@@ -104,18 +115,20 @@ def _rank_memories(query, rows, limit=20, scope=None, scope_id=None):
     except Exception: pass
     ranked=[]
     for row in rows:
-        semantic=_cosine(query_embedding,_unpack_embedding(row.get("embedding"))) if query_embedding else 0.0
         lexical=_lexical_score(query,row)
-        semantic=max(semantic, lexical * 0.75)
-        scope_score=SCOPE_WEIGHTS.get(row["scope"],0.75)
-        if scope and row["scope"] == scope: scope_score=1.0
-        if scope_id and row["scope_id"] == scope_id: scope_score=1.0
+        semantic=_cosine(query_embedding,_unpack_embedding(row.get("embedding"))) if query_embedding else 0.0
+        # Lexical matching is a fallback/boost, never a substitute that creates semantic similarity.
+        if not query_embedding or not row.get("embedding"):
+            semantic=lexical
+        else:
+            semantic=max(semantic, lexical * 0.75)
+        scope_score=_scope_score(row["scope"],scope,scope_id,row.get("scope_id"))
         recency=_recency_score(row["updated_at"])
         confidence=max(0.0,min(1.0,float(row["confidence"] or 0.0)))
         total=0.55*semantic + 0.20*scope_score + 0.15*recency + 0.10*confidence
-        row["semantic_similarity"]=round(semantic,4); row["scope_score"]=round(scope_score,4); row["recency_score"]=round(recency,4); row["relevance_score"]=round(total,4)
+        row["lexical_score"]=round(lexical,4); row["semantic_similarity"]=round(semantic,4); row["scope_score"]=round(scope_score,4); row["recency_score"]=round(recency,4); row["relevance_score"]=round(total,4)
         ranked.append(row)
-    ranked.sort(key=lambda r:(r["relevance_score"],r["updated_at"]),reverse=True)
+    ranked.sort(key=lambda r:(r["relevance_score"],r["semantic_similarity"],r["updated_at"]),reverse=True)
     return ranked[:max(1,min(int(limit),100))]
 
 
