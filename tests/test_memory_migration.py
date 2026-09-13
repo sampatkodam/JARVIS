@@ -49,7 +49,7 @@ class MemoryMigrationTests(unittest.TestCase):
         self.assertEqual(FakeGemini.calls, 3)
 
     def test_start_is_non_blocking_and_idempotent_while_running(self):
-        with patch("app.memory_migration._run") as runner:
+        with patch("app.memory_migration._run"):
             first = migration.start_embedding_migration()
             second = migration.start_embedding_migration()
         self.assertIn(first["status"], {"running", "idle"})
@@ -61,7 +61,7 @@ class MemoryMigrationTests(unittest.TestCase):
             first = upsert_memory("global", None, "fact", "first", "First")
             second = upsert_memory("global", None, "fact", "second", "Second")
             with db.connect() as conn:
-                conn.execute("UPDATE memories SET embedding=NULL, embedding_model=NULL")
+                conn.execute("UPDATE memories SET embedding=? WHERE id=?", (b"[1.0,0.0]", first))
                 conn.execute("INSERT INTO embedding_migration_jobs (id,status,total,processed,embedded,skipped,failed,last_memory_id,started_at,updated_at) VALUES (1,'stopped',2,1,1,0,0,?,datetime('now'),datetime('now'))", (first,))
             migration._run()
         status = migration.migration_status()
@@ -77,6 +77,16 @@ class MemoryMigrationTests(unittest.TestCase):
         status = migration.start_embedding_migration()
         self.assertEqual(status["status"], "running")
         self.assertIsNone(migration._thread)
+
+    def test_stale_running_job_is_reported_and_can_be_resumed(self):
+        with db.connect() as conn:
+            conn.execute("INSERT INTO embedding_migration_jobs (id,status,total,updated_at,heartbeat_at,worker_id) VALUES (1,'running',0,datetime('now'),datetime('now', '-60 seconds'),'dead-worker')")
+        status = migration.migration_status()
+        self.assertEqual(status["status"], "stale")
+        with patch("app.memory_migration._run"):
+            resumed = migration.resume_embedding_migration()
+        self.assertEqual(resumed["status"], "running")
+        self.assertIsNotNone(migration._thread)
 
 
 if __name__ == "__main__":
