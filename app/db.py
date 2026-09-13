@@ -83,6 +83,21 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
     INSERT INTO memory_fts(memory_fts, rowid, content, key, kind, scope, scope_id) VALUES('delete', old.id, old.content, old.key, old.kind, old.scope, old.scope_id);
     INSERT INTO memory_fts(rowid, content, key, kind, scope, scope_id) VALUES(new.id, new.content, new.key, new.kind, new.scope, new.scope_id);
 END;
+CREATE TABLE IF NOT EXISTS embedding_migration_jobs (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    status TEXT NOT NULL,
+    total INTEGER NOT NULL DEFAULT 0,
+    processed INTEGER NOT NULL DEFAULT 0,
+    embedded INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    last_memory_id INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    worker_id TEXT,
+    heartbeat_at TEXT,
+    started_at TEXT,
+    updated_at TEXT NOT NULL
+);
 '''
 
 
