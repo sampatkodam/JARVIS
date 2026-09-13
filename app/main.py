@@ -10,13 +10,13 @@ from app.config import BASE_DIR
 from app.queue import TaskWorker
 from app.gemini import Gemini
 from app.memory import add_message, conversation_history, extract_memories, extract_workspace_memory, memory_context, new_conversation, search_memories, task_history, upsert_memory
-from app.memory_migration import migration_status, start_embedding_migration, stop_embedding_migration
+from app.memory_migration import migration_status, resume_embedding_migration, start_embedding_migration, stop_embedding_migration
 
 worker = TaskWorker()
 
 @asynccontextmanager
 async def lifespan(app):
-    worker.start(); yield; worker.stop()
+    worker.start(); resume_embedding_migration(); yield; worker.stop()
 
 app = FastAPI(title="JARVIS V0.4", version="0.4.0", lifespan=lifespan)
 STATIC = BASE_DIR / "web"
