@@ -10,7 +10,7 @@ from app.config import BASE_DIR
 from app.queue import TaskWorker
 from app.gemini import Gemini
 from app.memory import add_message, conversation_history, extract_memories, extract_workspace_memory, memory_context, new_conversation, search_memories, task_history, upsert_memory
-from app.memory_migration import migration_status, start_embedding_migration
+from app.memory_migration import migration_status, start_embedding_migration, stop_embedding_migration
 
 worker = TaskWorker()
 
@@ -118,6 +118,10 @@ def memory_workspace_extract():
 @app.post("/api/memory/embeddings/migrate")
 def memory_embeddings_migrate():
     return start_embedding_migration()
+
+@app.post("/api/memory/embeddings/migrate/stop")
+def memory_embeddings_migrate_stop():
+    return stop_embedding_migration()
 
 @app.get("/api/memory/embeddings/migrate")
 def memory_embeddings_migrate_status():
