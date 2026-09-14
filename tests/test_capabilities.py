@@ -24,8 +24,8 @@ class CapabilityTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_workspace_write_allowed(self):
-        allowed, _, cap = capabilities.evaluate("write_file", {"path": "src/app.py"})
-        self.assertTrue(allowed)
+        allowed, reason, cap = capabilities.evaluate("write_file", {"path": "src/app.py"})
+        self.assertTrue(allowed, reason)
         self.assertEqual(cap.risk_class, capabilities.WORKSPACE_MUTATION)
 
     def test_parent_traversal_rejected(self):
@@ -43,6 +43,10 @@ class CapabilityTests(unittest.TestCase):
             with self.subTest(command=command):
                 allowed, reason, _ = capabilities.evaluate("run_shell", {"command": command})
                 self.assertTrue(allowed, reason)
+
+    def test_chained_unknown_executable_rejected(self):
+        allowed, _, _ = capabilities.evaluate("run_shell", {"command": "python -m unittest && unknown_tool --check"})
+        self.assertFalse(allowed)
 
     def test_audit_row_written_for_rejection(self):
         result = execute_tool("run_shell", {"command": "unknown_tool --check"}, task_id="task-1", step_id=3)
