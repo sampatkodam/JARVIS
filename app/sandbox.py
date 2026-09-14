@@ -1,6 +1,7 @@
 """Docker-backed OS isolation boundary for autonomous JARVIS commands."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -22,6 +23,9 @@ DEFAULT_NETWORK = os.getenv("JARVIS_SANDBOX_NETWORK", "none")
 SIGNING_POLICY = os.getenv("JARVIS_SANDBOX_SIGNING_POLICY", "config/sandbox-signing-policy.json")
 _DIGEST_RE = re.compile(r"^(?P<name>.+)@sha256:(?P<digest>[0-9a-fA-F]{64})$")
 _KEY_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_REKOR_URL_RE = re.compile(r"^https://[^\s/]+(?:/[^\s]*)?$")
+_SHA256_B64_LEN = 44
+
 
 @dataclass(frozen=True)
 class SandboxConfig:
@@ -44,8 +48,8 @@ def load_signing_policy(path: str = SIGNING_POLICY) -> dict:
         policy = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Sandbox signing policy is unavailable or invalid: {path!r}.") from exc
-    if policy.get("version") != 2 or policy.get("verifier") != "cosign" or policy.get("required") is not True:
-        raise RuntimeError("Sandbox signing policy must require Cosign verification (version 2).")
+    if policy.get("version") != 3 or policy.get("verifier") != "cosign" or policy.get("required") is not True:
+        raise RuntimeError("Sandbox signing policy must require Cosign verification (version 3).")
     keys = policy.get("trusted_keys")
     if not isinstance(keys, list) or not keys:
         raise RuntimeError("Sandbox signing policy must define at least one trusted key.")
@@ -67,11 +71,91 @@ def load_signing_policy(path: str = SIGNING_POLICY) -> dict:
         raise RuntimeError("Sandbox signing policy has no active trusted keys.")
     if policy.get("key_id") is not None and policy["key_id"] not in ids:
         raise RuntimeError(f"Sandbox signing policy references unknown key ID {policy['key_id']!r}.")
+
+    tlog = policy.get("transparency_log")
+    if not isinstance(tlog, dict) or tlog.get("required") is not True:
+        raise RuntimeError("Sandbox signing policy must require Sigstore transparency-log inclusion proofs.")
+    rekor_url = tlog.get("rekor_url", "https://rekor.sigstore.dev")
+    if not isinstance(rekor_url, str) or not _REKOR_URL_RE.fullmatch(rekor_url):
+        raise RuntimeError("Sandbox signing policy has an invalid Rekor URL.")
     return policy
 
 
+def _decode_b64_hash(value: object, field: str) -> bytes:
+    if not isinstance(value, str):
+        raise RuntimeError(f"Transparency-log inclusion proof field {field!r} is missing or invalid.")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"Transparency-log inclusion proof field {field!r} is not valid base64.") from exc
+    if len(decoded) != 32:
+        raise RuntimeError(f"Transparency-log inclusion proof field {field!r} must contain a SHA-256 hash.")
+    return decoded
+
+
+def verify_inclusion_proof(output: str) -> dict:
+    """Require Cosign JSON output to contain a structurally valid Rekor inclusion proof.
+
+    Cosign performs the cryptographic signature, Rekor checkpoint, and Merkle-proof
+    verification. JARVIS additionally fails closed unless that verified result
+    actually contains the expected transparency-log inclusion proof material.
+    """
+    try:
+        decoded = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Cosign transparency-log verification returned invalid JSON.") from exc
+
+    entries = decoded if isinstance(decoded, list) else [decoded]
+    proofs = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        # Cosign/Sigstore bundle-style output places tlog entries here. Some
+        # versions nest verification material one level deeper.
+        materials = item.get("verificationMaterial")
+        candidates = materials.get("tlogEntries", []) if isinstance(materials, dict) else item.get("tlogEntries", [])
+        if not isinstance(candidates, list):
+            continue
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                continue
+            proof = entry.get("inclusionProof")
+            if not isinstance(proof, dict):
+                continue
+            hashes = proof.get("hashes")
+            if not isinstance(hashes, list) or not hashes:
+                continue
+            if not isinstance(proof.get("checkpoint"), dict) or not isinstance(proof["checkpoint"].get("envelope"), str) or not proof["checkpoint"]["envelope"].strip():
+                continue
+            try:
+                log_index = int(proof.get("logIndex"))
+                tree_size = int(proof.get("treeSize"))
+            except (TypeError, ValueError):
+                continue
+            if log_index < 0 or tree_size <= 0 or log_index >= tree_size:
+                continue
+            try:
+                root_hash = _decode_b64_hash(proof.get("rootHash"), "rootHash")
+                decoded_hashes = [_decode_b64_hash(value, "hashes") for value in hashes]
+            except RuntimeError:
+                continue
+            # The actual Merkle/checkpoint cryptographic verification is done by
+            # Cosign. These invariants prevent accepting a merely present but
+            # malformed proof from a successful-looking verifier output.
+            proofs.append({
+                "log_index": log_index,
+                "tree_size": tree_size,
+                "root_hash": root_hash,
+                "hash_count": len(decoded_hashes),
+                "checkpoint": proof["checkpoint"]["envelope"],
+            })
+    if not proofs:
+        raise RuntimeError("Sigstore transparency-log inclusion proof is missing or invalid.")
+    return proofs[0]
+
+
 def verify_image_signature(image: str, *, policy: dict | None = None, runner=None) -> str:
-    """Return the trusted key ID that verifies the exact digest-pinned image; fail closed otherwise."""
+    """Return the trusted key ID only after signature and Rekor inclusion verification."""
     name, digest = parse_pinned_image(image)
     policy = policy or load_signing_policy()
     keys_by_id = {key["id"]: key for key in policy["trusted_keys"]}
@@ -79,6 +163,7 @@ def verify_image_signature(image: str, *, policy: dict | None = None, runner=Non
     candidates = [keys_by_id[active_id]] if active_id is not None else [key for key in policy["trusted_keys"] if not key.get("revoked", False)]
     execute = runner or subprocess.run
     target = f"{name}@sha256:{digest}"
+    rekor_url = policy["transparency_log"].get("rekor_url", "https://rekor.sigstore.dev")
     errors = []
     for key in candidates:
         if key.get("revoked", False):
@@ -88,17 +173,22 @@ def verify_image_signature(image: str, *, policy: dict | None = None, runner=Non
         if not key_path:
             errors.append(f"key {key['id']} is not configured")
             continue
-        command = ["cosign", "verify", "--key", key_path, target]
+        command = ["cosign", "verify", "--key", key_path, "--rekor-url", rekor_url, "--output", "json", target]
         try:
             result = execute(command, capture_output=True, text=True, check=False, timeout=30)
         except (OSError, subprocess.SubprocessError) as exc:
             errors.append(f"key {key['id']}: verifier error: {exc}")
             continue
         if getattr(result, "returncode", 1) == 0:
+            try:
+                verify_inclusion_proof(getattr(result, "stdout", ""))
+            except RuntimeError as exc:
+                errors.append(f"key {key['id']}: {exc}")
+                continue
             return key["id"]
         detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "verification failed").strip()
         errors.append(f"key {key['id']}: {detail[-300:]}")
-    raise RuntimeError("Sandbox image signature verification failed: " + "; ".join(errors))
+    raise RuntimeError("Sandbox image signature/transparency verification failed: " + "; ".join(errors))
 
 
 def verify_image_digest(client, image: str) -> str:
@@ -151,7 +241,7 @@ def run_sandboxed(command: str, *, network: str | None = None, config: SandboxCo
         signing_key_id = verify_image_signature(verified_image)
         result = client.containers.run(verified_image, command=["sh", "-lc", f"timeout {COMMAND_TIMEOUT}s sh -lc {shlex.quote(command)}"], working_dir="/workspace", volumes={str(Path(WORKSPACE).resolve()): {"bind": "/workspace", "mode": "rw"}}, network_mode=selected_network, mem_limit=cfg.memory, nano_cpus=int(cfg.cpus * 1_000_000_000), pids_limit=cfg.pids_limit, read_only=True, tmpfs={"/tmp": "rw,nosuid,nodev,noexec,size=268435456"}, cap_drop=["ALL"], security_opt=["no-new-privileges:true"], remove=True, stdout=True, stderr=True, init=True)
         text = result.decode("utf-8", errors="replace")
-        return {"command": command, "return_code": 0, "stdout": text[-MAX_OUTPUT_CHARS:], "stderr": "", "success": True, "sandbox": "docker", "image": verified_image, "signature_verified": True, "signing_key_id": signing_key_id, "network": selected_network, "memory_limit": cfg.memory, "cpu_limit": cfg.cpus, "pids_limit": cfg.pids_limit}
+        return {"command": command, "return_code": 0, "stdout": text[-MAX_OUTPUT_CHARS:], "stderr": "", "success": True, "sandbox": "docker", "image": verified_image, "signature_verified": True, "transparency_log_verified": True, "signing_key_id": signing_key_id, "network": selected_network, "memory_limit": cfg.memory, "cpu_limit": cfg.cpus, "pids_limit": cfg.pids_limit}
     except DockerException as exc:
         return {"command": command, "return_code": 1, "stdout": "", "stderr": str(exc)[-MAX_OUTPUT_CHARS:], "success": False, "sandbox": "docker", "network": selected_network}
     finally:
