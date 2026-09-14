@@ -229,7 +229,9 @@ def execute_task(task_id: str):
             existing = get_task(task_id)["steps"]
             passed = {s["description"] for s in existing if s["status"] == "passed"}
             log_task(task_id, f"Planning cycle {cycle}.")
-            ranked_memory = memory_context(goal, limit=12, scope="project", scope_id=task_id)
+            # A task's own memory must receive task-scope priority. Project, workspace,
+            # conversation, and global memories remain eligible through the ranked search.
+            ranked_memory = memory_context(goal, limit=12, scope="task", scope_id=task_id)
             steps = plan(gemini, goal, recovery, ranked_memory)
             state = checkpoint(task_id)
             if state != "running":
