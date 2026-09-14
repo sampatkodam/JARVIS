@@ -2,7 +2,7 @@ import json
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
-from threading import Event, Lock, Thread
+from threading import Event, RLock, Thread
 
 from app.db import connect
 from app.gemini import Gemini
@@ -11,7 +11,7 @@ EMBEDDING_MODEL = "gemini-embedding-001"
 LEASE_SECONDS = 30
 POLL_SECONDS = 0.05
 
-_state_lock = Lock()
+_state_lock = RLock()
 _state = {"status": "idle", "total": 0, "processed": 0, "embedded": 0, "skipped": 0, "failed": 0, "last_memory_id": 0, "last_error": None, "worker_id": None, "heartbeat_at": None, "started_at": None, "updated_at": None}
 _thread = None
 _stop = Event()
@@ -68,9 +68,11 @@ def _set_db(updates):
 
 
 def _claim_job(reset=False):
+    """Atomically acquire the durable migration lease for this process."""
     now = _now()
     lease = (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).isoformat()
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM embedding_migration_jobs WHERE id=1").fetchone()
         if row and row["status"] == "running" and not _stale(row["heartbeat_at"]):
             return row["worker_id"] == _WORKER_ID
