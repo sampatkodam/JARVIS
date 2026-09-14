@@ -1,6 +1,17 @@
 {
-  "version": 1,
+  "version": 2,
   "verifier": "cosign",
   "required": true,
-  "public_key_env": "JARVIS_SANDBOX_COSIGN_PUBLIC_KEY"
+  "trusted_keys": [
+    {
+      "id": "sandbox-key-2026-a",
+      "public_key_env": "JARVIS_SANDBOX_COSIGN_PUBLIC_KEY_A",
+      "revoked": false
+    },
+    {
+      "id": "sandbox-key-2026-b",
+      "public_key_env": "JARVIS_SANDBOX_COSIGN_PUBLIC_KEY_B",
+      "revoked": false
+    }
+  ]
 }
