@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "verifier": "cosign",
   "required": true,
   "trusted_keys": [
@@ -13,5 +13,9 @@
       "public_key_env": "JARVIS_SANDBOX_COSIGN_PUBLIC_KEY_B",
       "revoked": false
     }
-  ]
+  ],
+  "transparency_log": {
+    "required": true,
+    "rekor_url": "https://rekor.sigstore.dev"
+  }
 }
