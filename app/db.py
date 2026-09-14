@@ -98,6 +98,20 @@ CREATE TABLE IF NOT EXISTS embedding_migration_jobs (
     started_at TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tool_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT,
+    step_id INTEGER,
+    tool_name TEXT NOT NULL,
+    risk_class TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    arguments TEXT,
+    result_summary TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_audit_task_created ON tool_audit(task_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_tool_audit_decision_created ON tool_audit(decision, created_at, id);
 '''
 
 
