@@ -201,8 +201,33 @@ Return:
     return gemini.json(prompt, SYSTEM)
 
 
+def _recover_interrupted_steps(task_id: str):
+    """Mark in-flight steps as interrupted after a worker/process restart.
+
+    The previous tool result is unknown at this point: the tool may have completed
+    before the process died, or may never have reached the tool at all. The planner
+    therefore receives explicit recovery context and must verify state before retrying.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, step_no, description FROM steps WHERE task_id=? AND status='running' ORDER BY step_no",
+            (task_id,),
+        ).fetchall()
+        if not rows:
+            return []
+        ts = now()
+        conn.execute(
+            """UPDATE steps SET status='interrupted',
+               critique=?, updated_at=? WHERE task_id=? AND status='running'""",
+            ("Worker interrupted while this step was in-flight; tool outcome is unknown and must be verified before retry.", ts, task_id),
+        )
+    for row in rows:
+        log_task(task_id, f"Recovered interrupted step {row['step_no']}: {row['description']}. Tool outcome is unknown; verification required.", "warning")
+    return [dict(row) for row in rows]
+
+
 def execute_task(task_id: str):
-    """Execute one claimed queue item with persistent pause/cancel checkpoints."""
+    """Execute one claimed queue item with durable step state and control checkpoints."""
     record = get_task(task_id)
     if not record:
         raise ValueError("Task not found.")
@@ -215,6 +240,12 @@ def execute_task(task_id: str):
     gemini = Gemini()
     goal = record["task"]["goal"]
     recovery = ""
+    interrupted = _recover_interrupted_steps(task_id)
+    if interrupted:
+        recovery = (
+            f"Recovered {len(interrupted)} interrupted step(s). Their tool outcome is unknown. "
+            "Verify current state before repeating any potentially side-effecting action."
+        )
     log_task(task_id, "Worker started execution.")
     try:
         for cycle in range(1, 13):
@@ -254,8 +285,28 @@ def execute_task(task_id: str):
 
             action = selected.get("tool_name")
             args = selected.get("tool_args") or {}
-            log_task(task_id, f"Executing step {len(existing) + 1}: {selected.get('description', '')}")
+            step_no = len(existing) + 1
+            description = selected.get("description", "")
+            log_task(task_id, f"Preparing step {step_no}: {description}")
             log_task(task_id, f"Tool: {action or 'reason'}")
+
+            # Persist the step BEFORE invoking the tool. A crash after the side effect
+            # but before result persistence now leaves a durable 'running' step that is
+            # converted to 'interrupted' on recovery instead of being silently retried.
+            with connect() as conn:
+                conn.execute(
+                    """INSERT INTO steps
+                    (task_id,step_no,action,description,status,tool_name,tool_args,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (task_id, step_no, action or "reason", description, "running", action, json.dumps(args), now(), now()),
+                )
+
+            state = checkpoint(task_id)
+            if state != "running":
+                with connect() as conn:
+                    conn.execute("UPDATE steps SET status='interrupted', critique=?, updated_at=? WHERE task_id=? AND step_no=? AND status='running'", ("Control request arrived before tool invocation; step was not executed.", now(), task_id, step_no))
+                return
+
             if action not in TOOLS:
                 output = {"success": False, "error": f"Unknown tool: {action}"}
             else:
@@ -266,6 +317,8 @@ def execute_task(task_id: str):
 
             state = checkpoint(task_id)
             if state != "running":
+                with connect() as conn:
+                    conn.execute("UPDATE steps SET status='interrupted', output=?, critique=?, updated_at=? WHERE task_id=? AND step_no=? AND status='running'", (json.dumps(output)[:20000], "Tool returned, but task control changed before verification; outcome must be reviewed on resume.", now(), task_id, step_no))
                 log_task(task_id, "Current tool call finished; worker will not continue to another step.", "warning")
                 return
 
@@ -273,17 +326,15 @@ def execute_task(task_id: str):
             result = critique(gemini, goal, selected, output)
             state = checkpoint(task_id)
             if state != "running":
+                with connect() as conn:
+                    conn.execute("UPDATE steps SET status='interrupted', output=?, critique=?, updated_at=? WHERE task_id=? AND step_no=? AND status='running'", (json.dumps(output)[:20000], "Tool result exists but verification was interrupted; outcome must be reviewed on resume.", now(), task_id, step_no))
                 return
             status = "passed" if result.get("passed") else "failed"
-            step_no = len(existing) + 1
             with connect() as conn:
                 conn.execute(
-                    """INSERT INTO steps
-                    (task_id,step_no,action,description,status,tool_name,tool_args,output,critique,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (task_id, step_no, action or "reason", selected.get("description", ""),
-                     status, action, json.dumps(args), json.dumps(output)[:20000],
-                     json.dumps(result)[:10000], now(), now()),
+                    """UPDATE steps SET status=?, output=?, critique=?, updated_at=?
+                       WHERE task_id=? AND step_no=? AND status='running'""",
+                    (status, json.dumps(output)[:20000], json.dumps(result)[:10000], now(), task_id, step_no),
                 )
             log_task(task_id, f"Step {step_no} {status}: {result.get('critique', '')}", "success" if status == "passed" else "warning")
             recovery = "" if status == "passed" else result.get("critique", "Step failed.")
