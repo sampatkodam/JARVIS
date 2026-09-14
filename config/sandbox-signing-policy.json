@@ -16,6 +16,8 @@
   ],
   "transparency_log": {
     "required": true,
-    "rekor_url": "https://rekor.sigstore.dev"
+    "rekor_url": "https://rekor.sigstore.dev",
+    "log_id": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0=",
+    "checkpoint_origin_prefix": "rekor.sigstore.dev - "
   }
 }
