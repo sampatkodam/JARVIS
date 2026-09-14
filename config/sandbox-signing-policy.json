@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "verifier": "cosign",
+  "required": true,
+  "public_key_env": "JARVIS_SANDBOX_COSIGN_PUBLIC_KEY"
+}
