@@ -11,7 +11,6 @@ from app.config import WORKSPACE
 SAFE = "safe"
 WORKSPACE_MUTATION = "workspace_mutation"
 SYSTEM_LEVEL = "system_level"
-BLOCKED = "blocked"
 
 @dataclass(frozen=True)
 class Capability:
@@ -32,8 +31,6 @@ CAPABILITIES = {
     "git_commit": Capability("git_commit", WORKSPACE_MUTATION, "Commit workspace changes."),
 }
 
-# Commands commonly used by a software agent. Keeping this list explicit makes
-# system administration an opt-in architectural decision rather than an accident.
 _ALLOWED_EXECUTABLES = {
     "python", "python3", "pip", "pip3", "uv", "poetry", "node", "npm", "npx",
     "pnpm", "yarn", "bun", "deno", "pytest", "git", "cargo", "rustc", "go",
@@ -41,10 +38,7 @@ _ALLOWED_EXECUTABLES = {
     "make", "cmake", "ninja", "ruff", "black", "mypy", "flake8",
     "pytest-asyncio", "coverage", "sqlite3",
 }
-
-# Shell control tokens are allowed only when they do not introduce an explicit
-# host-level path. This supports normal build/test pipelines while keeping the
-# policy independent of the host OS.
+_SHELL_OPERATORS = {"&&", "||", ";", "|", "&"}
 _ABSOLUTE = re.compile(r"(?:^|\s)(?:[A-Za-z]:[\\/]|/[A-Za-z0-9_.~-])")
 _TRAVERSAL = re.compile(r"(?:^|[\\/])\.\.(?:[\\/]|$)")
 
@@ -69,6 +63,19 @@ def _executable_allowed(token: str) -> bool:
     return base in _ALLOWED_EXECUTABLES
 
 
+def _all_command_executables_allowed(tokens: list[str]) -> bool:
+    expect_executable = True
+    for token in tokens:
+        if token in _SHELL_OPERATORS:
+            expect_executable = True
+            continue
+        if expect_executable:
+            if not _executable_allowed(token):
+                return False
+            expect_executable = False
+    return not expect_executable
+
+
 def evaluate(tool_name: str, args: dict[str, Any] | None = None) -> tuple[bool, str, Capability]:
     args = args or {}
     cap = capability(tool_name)
@@ -89,8 +96,8 @@ def evaluate(tool_name: str, args: dict[str, Any] | None = None) -> tuple[bool, 
         tokens = _tokens(command)
         if not command or not tokens:
             return False, "Shell command is empty or malformed.", cap
-        if not _executable_allowed(tokens[0]):
-            return False, "Executable is outside JARVIS's autonomous workspace capability set.", Capability(tool_name, SYSTEM_LEVEL, cap.description)
+        if not _all_command_executables_allowed(tokens):
+            return False, "Every shell command segment must use an approved development executable.", Capability(tool_name, SYSTEM_LEVEL, cap.description)
         if _TRAVERSAL.search(command):
             return False, "Command contains an explicit workspace traversal path.", cap
         if _ABSOLUTE.search(command):
