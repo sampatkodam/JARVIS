@@ -1,6 +1,7 @@
 import json
 import math
 import re
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from app.config import WORKSPACE
@@ -92,10 +93,35 @@ def task_history(limit=30):
 
 
 def _candidate_memories(query, scopes=None):
+    """Build a hybrid candidate pool from recent memories plus FTS lexical hits.
+
+    The recent window preserves semantic recall for queries with little lexical overlap,
+    while FTS ensures an old exact-match memory is not lost merely because it fell outside
+    the recent-memory window. Malformed FTS input is treated as a cache miss, never as a
+    search failure.
+    """
     scope_clause = " AND scope IN (" + ",".join("?" for _ in scopes) + ")" if scopes else ""
-    params=list(scopes or [])
+    scope_params=list(scopes or [])
     with connect() as conn:
-        rows=conn.execute(f"SELECT id,scope,scope_id,kind,key,content,source_type,source_id,confidence,embedding,embedding_model,created_at,updated_at FROM memories WHERE 1=1{scope_clause} ORDER BY updated_at DESC LIMIT 500",params).fetchall()
+        recent=conn.execute(
+            f"SELECT id FROM memories WHERE 1=1{scope_clause} ORDER BY updated_at DESC LIMIT 500",
+            scope_params,
+        ).fetchall()
+        ids={row["id"] for row in recent}
+        tokens=re.findall(r"[a-z0-9_]+", str(query).lower())
+        if tokens:
+            fts_query=" OR ".join(f'"{token}"' for token in dict.fromkeys(tokens))
+            try:
+                lexical=conn.execute("SELECT rowid FROM memory_fts WHERE memory_fts MATCH ? LIMIT 200", (fts_query,)).fetchall()
+                ids.update(row["rowid"] for row in lexical)
+            except sqlite3.Error:
+                pass
+        if not ids:return []
+        placeholders=",".join("?" for _ in ids)
+        rows=conn.execute(
+            f"SELECT id,scope,scope_id,kind,key,content,source_type,source_id,confidence,embedding,embedding_model,created_at,updated_at FROM memories WHERE id IN ({placeholders}){scope_clause}",
+            [*ids,*scope_params],
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
