@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import tempfile
 import unittest
@@ -10,6 +12,8 @@ from app import sandbox
 class SandboxImageProvenanceTests(unittest.TestCase):
     DIGEST = "a" * 64
     IMAGE = f"registry.example/jarvis-sandbox@sha256:{DIGEST}"
+    ROOT_HASH = base64.b64encode(b"r" * 32).decode()
+    PROOF_HASH = base64.b64encode(b"h" * 32).decode()
 
     def test_mutable_tag_is_rejected(self):
         for image in ("jarvis-sandbox:latest", "jarvis-sandbox:v1", "python:3.11-slim"):
@@ -32,28 +36,47 @@ class SandboxImageProvenanceTests(unittest.TestCase):
         client.images.get.return_value.attrs = {"RepoDigests": [self.IMAGE]}
         self.assertEqual(sandbox.verify_image_digest(client, self.IMAGE), self.IMAGE)
 
-    @staticmethod
-    def policy():
-        return {"version": 2, "verifier": "cosign", "required": True, "trusted_keys": [
+    @classmethod
+    def policy(cls):
+        return {"version": 3, "verifier": "cosign", "required": True, "trusted_keys": [
             {"id": "key-a", "public_key_env": "TEST_KEY_A", "revoked": False},
             {"id": "key-b", "public_key_env": "TEST_KEY_B", "revoked": False},
-        ]}
+        ], "transparency_log": {"required": True, "rekor_url": "https://rekor.sigstore.dev"}}
+
+    @classmethod
+    def valid_cosign_output(cls):
+        return json.dumps([{
+            "verificationMaterial": {
+                "tlogEntries": [{
+                    "logIndex": "125680200",
+                    "inclusionProof": {
+                        "logIndex": "3775938",
+                        "rootHash": cls.ROOT_HASH,
+                        "treeSize": "3775939",
+                        "hashes": [cls.PROOF_HASH],
+                        "checkpoint": {"envelope": "rekor.sigstore.dev - signed checkpoint"},
+                    },
+                }]
+            }
+        }])
 
     def test_rotation_accepts_new_key_when_old_key_is_revoked(self):
-        runner = Mock(side_effect=[Mock(returncode=1, stdout="", stderr="old key rejected"), Mock(returncode=0, stdout="verified", stderr="")])
+        runner = Mock(side_effect=[
+            Mock(returncode=0, stdout=self.valid_cosign_output(), stderr="")
+        ])
         with patch.dict(os.environ, {"TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub"}, clear=False):
             policy = self.policy()
             policy["trusted_keys"][0]["revoked"] = True
             self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
-        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
+        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", "--rekor-url", "https://rekor.sigstore.dev", "--output", "json", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
 
     def test_revoked_key_is_never_invoked(self):
-        runner = Mock(return_value=Mock(returncode=0, stdout="verified", stderr=""))
+        runner = Mock(return_value=Mock(returncode=0, stdout=self.valid_cosign_output(), stderr=""))
         with patch.dict(os.environ, {"TEST_KEY_A": "revoked.pub", "TEST_KEY_B": "new.pub"}, clear=False):
             policy = self.policy()
             policy["trusted_keys"][0]["revoked"] = True
             self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
-        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
+        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", "--rekor-url", "https://rekor.sigstore.dev", "--output", "json", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
 
     def test_explicit_revoked_key_id_is_rejected(self):
         runner = Mock()
@@ -66,19 +89,18 @@ class SandboxImageProvenanceTests(unittest.TestCase):
         runner.assert_not_called()
 
     def test_explicit_key_id_selects_rotation_target(self):
-        runner = Mock(return_value=Mock(returncode=0, stdout="verified", stderr=""))
+        runner = Mock(return_value=Mock(returncode=0, stdout=self.valid_cosign_output(), stderr=""))
         with patch.dict(os.environ, {"TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub"}, clear=False):
             policy = self.policy()
             policy["key_id"] = "key-b"
             self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
-        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
+        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", "--rekor-url", "https://rekor.sigstore.dev", "--output", "json", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
 
     def test_no_active_keys_is_invalid_policy(self):
         policy = self.policy()
         for key in policy["trusted_keys"]:
             key["revoked"] = True
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            import json
             json.dump(policy, f)
             path = f.name
         try:
@@ -87,12 +109,52 @@ class SandboxImageProvenanceTests(unittest.TestCase):
         finally:
             Path(path).unlink(missing_ok=True)
 
-    def test_valid_signature_is_accepted(self):
-        runner = Mock(return_value=Mock(returncode=0, stdout="verified", stderr=""))
+    def test_valid_signature_and_inclusion_proof_are_accepted(self):
+        runner = Mock(return_value=Mock(returncode=0, stdout=self.valid_cosign_output(), stderr=""))
         with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
             policy = self.policy()
             policy["trusted_keys"] = [policy["trusted_keys"][0]]
             self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-a")
+
+    def test_missing_inclusion_proof_fails_closed(self):
+        runner = Mock(return_value=Mock(returncode=0, stdout=json.dumps([{
+            "verificationMaterial": {"tlogEntries": []}
+        }]), stderr=""))
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
+            policy = self.policy()
+            policy["trusted_keys"] = [policy["trusted_keys"][0]]
+            with self.assertRaisesRegex(RuntimeError, "inclusion proof is missing or invalid"):
+                sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
+
+    def test_invalid_inclusion_proof_fails_closed(self):
+        invalid = json.loads(self.valid_cosign_output())
+        invalid[0]["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["rootHash"] = "not-base64"
+        runner = Mock(return_value=Mock(returncode=0, stdout=json.dumps(invalid), stderr=""))
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
+            policy = self.policy()
+            policy["trusted_keys"] = [policy["trusted_keys"][0]]
+            with self.assertRaisesRegex(RuntimeError, "inclusion proof is missing or invalid"):
+                sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
+
+    def test_invalid_cosign_json_fails_closed(self):
+        runner = Mock(return_value=Mock(returncode=0, stdout="not-json", stderr=""))
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
+            policy = self.policy()
+            policy["trusted_keys"] = [policy["trusted_keys"][0]]
+            with self.assertRaisesRegex(RuntimeError, "invalid JSON"):
+                sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
+
+    def test_policy_requires_transparency_log(self):
+        policy = self.policy()
+        del policy["transparency_log"]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(policy, f)
+            path = f.name
+        try:
+            with self.assertRaisesRegex(RuntimeError, "transparency-log inclusion proofs"):
+                sandbox.load_signing_policy(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 
 @unittest.skipUnless(sandbox.docker_available(), "Docker daemon unavailable")
@@ -100,7 +162,7 @@ class SandboxIsolationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not sandbox.image_available():
-            raise unittest.SkipTest("JARVIS sandbox image unavailable, digest-pinned, or signed")
+            raise unittest.SkipTest("JARVIS sandbox image unavailable, digest-pinned, signed, or transparency-log verified")
         cls.tmp = tempfile.TemporaryDirectory()
         sandbox.WORKSPACE = Path(cls.tmp.name).resolve()
 
