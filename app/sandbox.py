@@ -77,6 +77,12 @@ def load_signing_policy(path: str = SIGNING_POLICY) -> dict:
     rekor_url = tlog.get("rekor_url", "https://rekor.sigstore.dev")
     if not isinstance(rekor_url, str) or not _REKOR_URL_RE.fullmatch(rekor_url):
         raise RuntimeError("Sandbox signing policy has an invalid Rekor URL.")
+    log_id = tlog.get("log_id")
+    if not isinstance(log_id, str) or not log_id.strip():
+        raise RuntimeError("Sandbox signing policy must pin the expected Rekor log ID.")
+    origin_prefix = tlog.get("checkpoint_origin_prefix")
+    if not isinstance(origin_prefix, str) or not origin_prefix.strip():
+        raise RuntimeError("Sandbox signing policy must pin the expected Rekor checkpoint origin prefix.")
     return policy
 
 
@@ -92,15 +98,51 @@ def _decode_b64_hash(value: object, field: str) -> bytes:
     return decoded
 
 
-def _validate_proof(proof: dict) -> dict | None:
+def _validate_checkpoint(envelope: object, *, tree_size: int, root_hash: bytes, transparency_log: dict) -> dict:
+    if not isinstance(envelope, str) or not envelope.strip():
+        raise RuntimeError("Sigstore checkpoint is missing or invalid.")
+    lines = envelope.replace("\r\n", "\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if len(lines) < 5 or lines[3].strip() != "":
+        raise RuntimeError("Sigstore checkpoint format is invalid.")
+    origin = lines[0].strip()
+    expected_prefix = transparency_log["checkpoint_origin_prefix"]
+    if not origin.startswith(expected_prefix):
+        raise RuntimeError(f"Unexpected Rekor checkpoint origin: {origin!r}.")
+    try:
+        checkpoint_tree_size = int(lines[1].strip())
+    except ValueError as exc:
+        raise RuntimeError("Sigstore checkpoint tree size is invalid.") from exc
+    checkpoint_root = _decode_b64_hash(lines[2].strip(), "checkpoint rootHash")
+    if checkpoint_tree_size != tree_size or checkpoint_root != root_hash:
+        raise RuntimeError("Sigstore checkpoint state does not match the inclusion proof.")
+    signature_line = lines[4].strip()
+    if not (signature_line.startswith("— ") or signature_line.startswith("- ")):
+        raise RuntimeError("Sigstore checkpoint signature is missing or invalid.")
+    signature_parts = signature_line[2:].split(None, 1)
+    if len(signature_parts) != 2 or not signature_parts[0]:
+        raise RuntimeError("Sigstore checkpoint signature identity is invalid.")
+    signer_name = signature_parts[0]
+    expected_host = transparency_log["rekor_url"].split("//", 1)[1].split("/", 1)[0]
+    if signer_name != expected_host:
+        raise RuntimeError(f"Unexpected Rekor checkpoint signer: {signer_name!r}.")
+    return {"origin": origin, "tree_size": checkpoint_tree_size, "root_hash": checkpoint_root, "signer": signer_name}
+
+
+def _validate_proof(proof: dict, *, log_id: object, transparency_log: dict) -> dict | None:
     if not isinstance(proof, dict):
         return None
+    expected_log_id = transparency_log["log_id"]
+    if log_id != expected_log_id:
+        raise RuntimeError(f"Unexpected Rekor log ID: {log_id!r}.")
     hashes = proof.get("hashes")
     if not isinstance(hashes, list) or not hashes:
         return None
     checkpoint = proof.get("checkpoint")
-    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("envelope"), str) or not checkpoint["envelope"].strip():
+    if not isinstance(checkpoint, dict):
         return None
+    envelope = checkpoint.get("envelope")
     try:
         log_index = int(proof.get("logIndex"))
         tree_size = int(proof.get("treeSize"))
@@ -110,25 +152,19 @@ def _validate_proof(proof: dict) -> dict | None:
         return None
     if log_index < 0 or tree_size <= 0 or log_index >= tree_size:
         return None
+    checkpoint_data = _validate_checkpoint(envelope, tree_size=tree_size, root_hash=root_hash, transparency_log=transparency_log)
     return {
         "log_index": log_index,
         "tree_size": tree_size,
         "root_hash": root_hash,
         "hash_count": len(decoded_hashes),
-        "checkpoint": checkpoint["envelope"],
+        "checkpoint": checkpoint_data,
+        "log_id": log_id,
     }
 
 
-def verify_inclusion_proof(output: str) -> dict:
-    """Require Cosign to return verified Rekor inclusion evidence.
-
-    Modern Cosign JSON exposes the verified Rekor receipt as
-    ``optional.Bundle.Payload`` (log index, log ID, body, integrated time and
-    signed entry timestamp). Cosign performs the cryptographic Rekor/Merkle
-    verification; JARVIS fails closed unless that verified transparency proof
-    evidence is present. Sigstore bundle-shaped ``verificationMaterial`` is
-    also accepted for compatibility with bundle-producing Cosign versions.
-    """
+def verify_inclusion_proof(output: str, *, transparency_log: dict) -> dict:
+    """Require verified Rekor inclusion evidence, expected log identity, and checkpoint state."""
     try:
         decoded = json.loads(output)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -139,46 +175,28 @@ def verify_inclusion_proof(output: str) -> dict:
         if not isinstance(item, dict):
             continue
 
-        optional = item.get("optional")
-        if isinstance(optional, dict):
-            bundle = optional.get("Bundle") or optional.get("bundle")
-            if isinstance(bundle, dict):
-                payload = bundle.get("Payload") or bundle.get("payload")
-                if isinstance(payload, dict):
-                    try:
-                        log_index = int(payload.get("logIndex"))
-                    except (TypeError, ValueError):
-                        log_index = -1
-                    body = payload.get("body")
-                    set_value = bundle.get("SignedEntryTimestamp") or bundle.get("signedEntryTimestamp")
-                    log_id = payload.get("logID") or payload.get("logId")
-                    if (
-                        log_index >= 0
-                        and isinstance(body, str) and body
-                        and isinstance(set_value, str) and set_value
-                        and isinstance(log_id, str) and log_id
-                    ):
-                        return {
-                            "log_index": log_index,
-                            "body": body,
-                            "log_id": log_id,
-                            "signed_entry_timestamp": set_value,
-                        }
-
         materials = item.get("verificationMaterial")
-        candidates = materials.get("tlogEntries", []) if isinstance(materials, dict) else item.get("tlogEntries", [])
-        if isinstance(candidates, list):
-            for entry in candidates:
-                proof = entry.get("inclusionProof") if isinstance(entry, dict) else None
-                valid = _validate_proof(proof)
-                if valid is not None:
-                    return valid
+        if isinstance(materials, dict) and isinstance(materials.get("tlogEntries"), list):
+            for entry in materials["tlogEntries"]:
+                if not isinstance(entry, dict):
+                    continue
+                log_obj = entry.get("logId") or entry.get("logID")
+                log_id = log_obj.get("keyId") if isinstance(log_obj, dict) else log_obj
+                try:
+                    return _validate_proof(entry.get("inclusionProof"), log_id=log_id, transparency_log=transparency_log)
+                except RuntimeError:
+                    raise
+
+        verification = item.get("verification")
+        if isinstance(verification, dict) and isinstance(verification.get("inclusionProof"), dict):
+            log_id = item.get("logID") or item.get("logId")
+            return _validate_proof(verification["inclusionProof"], log_id=log_id, transparency_log=transparency_log)
 
     raise RuntimeError("Sigstore transparency-log inclusion proof is missing or invalid.")
 
 
 def verify_image_signature(image: str, *, policy: dict | None = None, runner=None) -> str:
-    """Return the trusted key ID only after signature and Rekor inclusion verification."""
+    """Return the trusted key ID only after signature, Rekor identity, and checkpoint verification."""
     name, digest = parse_pinned_image(image)
     policy = policy or load_signing_policy()
     keys_by_id = {key["id"]: key for key in policy["trusted_keys"]}
@@ -186,7 +204,8 @@ def verify_image_signature(image: str, *, policy: dict | None = None, runner=Non
     candidates = [keys_by_id[active_id]] if active_id is not None else [key for key in policy["trusted_keys"] if not key.get("revoked", False)]
     execute = runner or subprocess.run
     target = f"{name}@sha256:{digest}"
-    rekor_url = policy["transparency_log"].get("rekor_url", "https://rekor.sigstore.dev")
+    transparency_log = policy["transparency_log"]
+    rekor_url = transparency_log.get("rekor_url", "https://rekor.sigstore.dev")
     errors = []
     for key in candidates:
         if key.get("revoked", False):
@@ -204,7 +223,7 @@ def verify_image_signature(image: str, *, policy: dict | None = None, runner=Non
             continue
         if getattr(result, "returncode", 1) == 0:
             try:
-                verify_inclusion_proof(getattr(result, "stdout", ""))
+                verify_inclusion_proof(getattr(result, "stdout", ""), transparency_log=transparency_log)
             except RuntimeError as exc:
                 errors.append(f"key {key['id']}: {exc}")
                 continue
