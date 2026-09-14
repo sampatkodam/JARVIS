@@ -1,6 +1,6 @@
 # JARVIS V0.4
 
-Cloud-first autonomous personal agent with a persistent queue, live task logs, safe task controls, and durable searchable memory.
+Cloud-first autonomous personal agent with a persistent queue, live task logs, safe task controls, durable searchable memory, and an OS-isolated execution sandbox.
 
 ## Included
 - FastAPI backend
@@ -18,9 +18,24 @@ Cloud-first autonomous personal agent with a persistent queue, live task logs, s
 - Explicit memory write API for durable decisions, constraints, preferences, and facts
 - Gemini API via official `google-genai` SDK
 - Workspace-scoped filesystem tools
-- Shell and Git tools
+- Docker-backed OS sandbox for autonomous shell/Git execution
+- Digest-pinned sandbox image verification; mutable tags are rejected
+- Network, filesystem, process, CPU, memory, capability, and privilege isolation
 - Planner -> Executor -> Critic loop
 - No local LLM/Ollama required
+
+## Sandbox provenance and pinning
+Autonomous tool execution never falls back to the host shell. JARVIS requires `JARVIS_SANDBOX_IMAGE` to be an immutable Docker reference of the form:
+
+```text
+registry.example/jarvis-sandbox@sha256:<64-hex-digest>
+```
+
+Mutable references such as `jarvis-sandbox:latest` or `jarvis-sandbox:v1` are rejected before execution. The daemon's `RepoDigests` are checked against the requested digest immediately before container creation; a missing or mismatched digest fails closed.
+
+The checked-in `Dockerfile.sandbox` also pins its Python base image by digest. Production deployments should publish the built sandbox image to a trusted registry and configure the exact resulting manifest digest in `JARVIS_SANDBOX_IMAGE`. The test workflow creates a temporary registry, pushes the built image, obtains its immutable digest, and runs the sandbox isolation suite against that digest.
+
+Sandbox containers mount only the configured workspace read/write. The container root filesystem is read-only, `/tmp` is a bounded `noexec` tmpfs, Linux capabilities are dropped, `no-new-privileges` is enabled, and CPU/memory/process limits are enforced. Network access is disabled by default; dependency installation commands receive explicit temporary bridge networking.
 
 ## Persistent memory architecture
 Memory is stored in the same durable SQLite database as the queue. `conversations` and `messages` preserve the chat timeline. `tasks` and `steps` preserve execution history. `memories` stores normalized durable facts with scope, kind, key, source, confidence, and timestamps. SQLite FTS5 provides indexed full-text search without adding a vector-database dependency.
@@ -80,6 +95,8 @@ notepad .env
 uvicorn app.main:app --reload
 ```
 
+Before autonomous execution, configure `JARVIS_SANDBOX_IMAGE` with the exact digest of the trusted sandbox image. If it is absent, malformed, mutable, unavailable, or mismatched, JARVIS refuses execution rather than falling back to the host.
+
 Open http://127.0.0.1:8000
 
 ## Tests
@@ -87,9 +104,9 @@ Open http://127.0.0.1:8000
 python -m unittest discover -s tests -v
 ```
 
-The V0.4 tests cover queue concurrency/retry behavior plus persistent memory insertion/search, conversation history round-tripping, and Gemini extraction persistence with a mocked Gemini client.
+The tests cover queue concurrency/retry behavior, persistent memory, conversation history, Gemini extraction, sandbox filesystem/network/resource isolation, mutable-tag rejection, digest mismatch rejection, and successful digest verification.
 
 ## Data and privacy
 The memory database is local SQLite by default. Only material explicitly sent to Gemini for extraction/chat is processed by the configured Gemini API. Memory extraction filters obvious secret material and does not intentionally persist credentials. The workspace extractor is bounded to small source/config/text files.
 
-This remains a development baseline. The shell safety policy is intentionally conservative but is not a production-grade sandbox.
+The autonomous execution path is now fail-closed behind an OS-level Docker sandbox. The remaining trust boundary includes the Docker daemon and the configured trusted image registry; sandbox image provenance is therefore verified by immutable digest before every execution.
