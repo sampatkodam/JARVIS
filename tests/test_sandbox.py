@@ -12,7 +12,8 @@ from app import sandbox
 class SandboxImageProvenanceTests(unittest.TestCase):
     DIGEST = "a" * 64
     IMAGE = f"registry.example/jarvis-sandbox@sha256:{DIGEST}"
-    LOG_ID = "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+    LOG_ID_A = "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+    LOG_ID_B = "zxGZFVvd0FEmjR8WrFwMdcAJ9vtaY/QXf44Y1wUeP6A="
     ROOT_HASH = base64.b64encode(b"r" * 32).decode()
 
     def test_mutable_tag_is_rejected(self):
@@ -38,63 +39,132 @@ class SandboxImageProvenanceTests(unittest.TestCase):
 
     @classmethod
     def policy(cls):
-        return {"version": 3, "verifier": "cosign", "required": True, "trusted_keys": [
-            {"id": "key-a", "public_key_env": "TEST_KEY_A", "revoked": False},
-            {"id": "key-b", "public_key_env": "TEST_KEY_B", "revoked": False},
-        ], "transparency_log": {
-            "required": True, "rekor_url": "https://rekor.sigstore.dev", "log_id": cls.LOG_ID,
-            "checkpoint_origin_prefix": "rekor.sigstore.dev - "}}
+        return {
+            "version": 4,
+            "verifier": "cosign",
+            "required": True,
+            "trusted_keys": [
+                {"id": "key-a", "public_key_env": "TEST_KEY_A", "revoked": False},
+                {"id": "key-b", "public_key_env": "TEST_KEY_B", "revoked": False},
+            ],
+            "transparency_log": {
+                "required": True,
+                "trusted_keys": [
+                    {
+                        "id": "rekor-a",
+                        "public_key_env": "TEST_REKOR_A",
+                        "rekor_url": "https://rekor.sigstore.dev",
+                        "log_id": cls.LOG_ID_A,
+                        "checkpoint_origin_prefix": "rekor.sigstore.dev - ",
+                        "revoked": False,
+                    },
+                    {
+                        "id": "rekor-b",
+                        "public_key_env": "TEST_REKOR_B",
+                        "rekor_url": "https://log2025-1.rekor.sigstore.dev",
+                        "log_id": cls.LOG_ID_B,
+                        "checkpoint_origin_prefix": "log2025-1.rekor.sigstore.dev - ",
+                        "revoked": False,
+                    },
+                ],
+            },
+        }
 
     @classmethod
-    def valid_checkpoint(cls):
-        return f"rekor.sigstore.dev - 2605736670972794746\n3775939\n{cls.ROOT_HASH}\n\n— rekor.sigstore.dev signed-checkpoint\n"
+    def valid_checkpoint(cls, origin="rekor.sigstore.dev - 2605736670972794746"):
+        return f"{origin}\n3775939\n{cls.ROOT_HASH}\n\n— {origin.split(' - ', 1)[0]} signed-checkpoint\n"
 
     @classmethod
-    def valid_cosign_output(cls):
+    def valid_cosign_output(cls, log_id=None, origin=None):
+        log_id = log_id or cls.LOG_ID_A
+        origin = origin or "rekor.sigstore.dev - 2605736670972794746"
         return json.dumps([{
             "critical": {"image": {"docker-manifest-digest": f"sha256:{cls.DIGEST}"}, "type": "cosign container image signature"},
-            "logID": cls.LOG_ID,
+            "logID": log_id,
             "verification": {"inclusionProof": {
                 "logIndex": 3775938, "rootHash": cls.ROOT_HASH, "treeSize": 3775939,
                 "hashes": [base64.b64encode(b"h" * 32).decode()],
-                "checkpoint": {"envelope": cls.valid_checkpoint()}}}
+                "checkpoint": {"envelope": cls.valid_checkpoint(origin)}}}
         }])
 
-    def _verify(self, output=None, policy=None):
+    def _verify(self, output=None, policy=None, expected_calls=1):
         runner = Mock(return_value=Mock(returncode=0, stdout=output or self.valid_cosign_output(), stderr=""))
-        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub", "TEST_KEY_B": "new.pub"}, clear=False):
-            selected = policy or self.policy(); selected["trusted_keys"] = [selected["trusted_keys"][0]]
+        with patch.dict(os.environ, {
+            "TEST_KEY_A": "trusted.pub", "TEST_KEY_B": "new.pub",
+            "TEST_REKOR_A": "rekor-a.pub", "TEST_REKOR_B": "rekor-b.pub",
+        }, clear=False):
+            selected = policy or self.policy()
+            selected["trusted_keys"] = [selected["trusted_keys"][0]]
             result = sandbox.verify_image_signature(self.IMAGE, policy=selected, runner=runner)
+        self.assertEqual(runner.call_count, expected_calls)
         return result, runner
 
-    def test_rotation_accepts_new_key_when_old_key_is_revoked(self):
+    def test_rotation_accepts_new_signing_key_when_old_key_is_revoked(self):
         runner = Mock(return_value=Mock(returncode=0, stdout=self.valid_cosign_output(), stderr=""))
-        with patch.dict(os.environ, {"TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub"}, clear=False):
+        with patch.dict(os.environ, {
+            "TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub",
+            "TEST_REKOR_A": "rekor-a.pub", "TEST_REKOR_B": "rekor-b.pub",
+        }, clear=False):
             policy = self.policy(); policy["trusted_keys"][0]["revoked"] = True
             self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
-        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", "--rekor-url", "https://rekor.sigstore.dev", "--output", "json", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(runner.call_args.args[0], ["cosign", "verify", "--key", "new.pub", "--rekor-url", "https://rekor.sigstore.dev", "--output", "json", self.IMAGE])
+        self.assertEqual(runner.call_args.kwargs["env"]["SIGSTORE_REKOR_PUBLIC_KEY"], "rekor-a.pub")
 
-    def test_revoked_key_is_never_invoked(self):
-        runner = Mock(return_value=Mock(returncode=0, stdout=self.valid_cosign_output(), stderr=""))
-        with patch.dict(os.environ, {"TEST_KEY_A": "revoked.pub", "TEST_KEY_B": "new.pub"}, clear=False):
-            policy = self.policy(); policy["trusted_keys"][0]["revoked"] = True
-            self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
-        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", "--rekor-url", "https://rekor.sigstore.dev", "--output", "json", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
+    def test_rotation_accepts_new_rekor_checkpoint_key(self):
+        output = self.valid_cosign_output(self.LOG_ID_B, "log2025-1.rekor.sigstore.dev - 42")
+        runner = Mock(return_value=Mock(returncode=0, stdout=output, stderr=""))
+        with patch.dict(os.environ, {
+            "TEST_KEY_A": "trusted.pub", "TEST_REKOR_A": "old-rekor.pub", "TEST_REKOR_B": "new-rekor.pub",
+        }, clear=False):
+            policy = self.policy(); policy["transparency_log"]["trusted_keys"][0]["revoked"] = True
+            details = sandbox.verify_image_signature_details(self.IMAGE, policy=policy, runner=runner)
+        self.assertEqual(details["signing_key_id"], "key-a")
+        self.assertEqual(details["rekor_key_id"], "rekor-b")
+        self.assertEqual(runner.call_args.args[0][5], "https://log2025-1.rekor.sigstore.dev")
+        self.assertEqual(runner.call_args.kwargs["env"]["SIGSTORE_REKOR_PUBLIC_KEY"], "new-rekor.pub")
 
-    def test_explicit_revoked_key_id_is_rejected(self):
+    def test_revoked_rekor_key_is_never_invoked(self):
+        output = self.valid_cosign_output(self.LOG_ID_B, "log2025-1.rekor.sigstore.dev - 42")
+        runner = Mock(return_value=Mock(returncode=0, stdout=output, stderr=""))
+        with patch.dict(os.environ, {
+            "TEST_KEY_A": "trusted.pub", "TEST_REKOR_A": "revoked.pub", "TEST_REKOR_B": "new.pub",
+        }, clear=False):
+            policy = self.policy(); policy["transparency_log"]["trusted_keys"][0]["revoked"] = True
+            self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-a")
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args.kwargs["env"]["SIGSTORE_REKOR_PUBLIC_KEY"], "new.pub")
+
+    def test_explicit_revoked_rekor_key_id_is_rejected(self):
         runner = Mock()
-        with patch.dict(os.environ, {"TEST_KEY_A": "revoked.pub"}, clear=False):
-            policy = self.policy(); policy["key_id"] = "key-a"; policy["trusted_keys"][0]["revoked"] = True
-            with self.assertRaisesRegex(RuntimeError, "revoked"):
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub", "TEST_REKOR_A": "revoked.pub"}, clear=False):
+            policy = self.policy(); policy["transparency_log"]["key_id"] = "rekor-a"; policy["transparency_log"]["trusted_keys"][0]["revoked"] = True
+            with self.assertRaisesRegex(RuntimeError, "revoked Rekor key"):
                 sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
         runner.assert_not_called()
 
-    def test_explicit_key_id_selects_rotation_target(self):
+    def test_explicit_rekor_key_id_selects_rotation_target(self):
+        output = self.valid_cosign_output(self.LOG_ID_B, "log2025-1.rekor.sigstore.dev - 42")
+        runner = Mock(return_value=Mock(returncode=0, stdout=output, stderr=""))
+        with patch.dict(os.environ, {
+            "TEST_KEY_A": "trusted.pub", "TEST_REKOR_A": "old.pub", "TEST_REKOR_B": "new.pub",
+        }, clear=False):
+            policy = self.policy(); policy["transparency_log"]["key_id"] = "rekor-b"
+            self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-a")
+        self.assertEqual(runner.call_args.kwargs["env"]["SIGSTORE_REKOR_PUBLIC_KEY"], "new.pub")
+
+    def test_revoked_signing_key_is_never_invoked(self):
         runner = Mock(return_value=Mock(returncode=0, stdout=self.valid_cosign_output(), stderr=""))
-        with patch.dict(os.environ, {"TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub"}, clear=False):
+        with patch.dict(os.environ, {"TEST_KEY_A": "revoked.pub", "TEST_KEY_B": "new.pub", "TEST_REKOR_A": "rekor-a.pub"}, clear=False):
+            policy = self.policy(); policy["trusted_keys"][0]["revoked"] = True
+            self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
+        self.assertEqual(runner.call_args.kwargs["env"]["SIGSTORE_REKOR_PUBLIC_KEY"], "rekor-a.pub")
+
+    def test_explicit_signing_key_id_selects_rotation_target(self):
+        runner = Mock(return_value=Mock(returncode=0, stdout=self.valid_cosign_output(), stderr=""))
+        with patch.dict(os.environ, {"TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub", "TEST_REKOR_A": "rekor-a.pub"}, clear=False):
             policy = self.policy(); policy["key_id"] = "key-b"
             self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
-        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", "--rekor-url", "https://rekor.sigstore.dev", "--output", "json", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(runner.call_args.args[0][2], "new.pub")
 
     def test_no_active_keys_is_invalid_policy(self):
         policy = self.policy()
@@ -102,7 +172,16 @@ class SandboxImageProvenanceTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(policy, f); path = f.name
         try:
-            with self.assertRaisesRegex(RuntimeError, "no active trusted keys"): sandbox.load_signing_policy(path)
+            with self.assertRaisesRegex(RuntimeError, "no active trusted signing keys"): sandbox.load_signing_policy(path)
+        finally: Path(path).unlink(missing_ok=True)
+
+    def test_no_active_rekor_keys_is_invalid_policy(self):
+        policy = self.policy()
+        for key in policy["transparency_log"]["trusted_keys"]: key["revoked"] = True
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(policy, f); path = f.name
+        try:
+            with self.assertRaisesRegex(RuntimeError, "no active trusted Rekor checkpoint keys"): sandbox.load_signing_policy(path)
         finally: Path(path).unlink(missing_ok=True)
 
     def test_valid_signature_and_checkpoint_are_accepted(self):
@@ -124,32 +203,32 @@ class SandboxImageProvenanceTests(unittest.TestCase):
 
     def test_missing_inclusion_proof_fails_closed(self):
         runner = Mock(return_value=Mock(returncode=0, stdout=json.dumps([{"critical": {"type": "cosign container image signature"}, "optional": {}}]), stderr=""))
-        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
-            policy = self.policy(); policy["trusted_keys"] = [policy["trusted_keys"][0]]
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub", "TEST_REKOR_A": "rekor-a.pub"}, clear=False):
+            policy = self.policy(); policy["trusted_keys"] = [policy["trusted_keys"][0]]; policy["transparency_log"]["trusted_keys"] = [policy["transparency_log"]["trusted_keys"][0]]
             with self.assertRaisesRegex(RuntimeError, "inclusion proof is missing or invalid"): sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
 
     def test_invalid_inclusion_proof_fails_closed(self):
-        invalid = json.loads(self.valid_cosign_output()); invalid[0]["verification"]["inclusionProof"]["checkpoint"]["envelope"] = "bad-checkpoint"
-        with self.assertRaisesRegex(RuntimeError, "checkpoint"): self._verify(json.dumps(invalid))
+        invalid = json.loads(self.valid_cosign_output()); del invalid[0]["verification"]["inclusionProof"]["hashes"]
+        with self.assertRaisesRegex(RuntimeError, "proof hashes are missing or invalid"): self._verify(json.dumps(invalid))
 
     def test_cosign_rejecting_invalid_transparency_proof_fails_closed(self):
         runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="no valid tlog entries found with proposed entry"))
-        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
-            policy = self.policy(); policy["trusted_keys"] = [policy["trusted_keys"][0]]
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub", "TEST_REKOR_A": "rekor-a.pub"}, clear=False):
+            policy = self.policy(); policy["trusted_keys"] = [policy["trusted_keys"][0]]; policy["transparency_log"]["trusted_keys"] = [policy["transparency_log"]["trusted_keys"][0]]
             with self.assertRaisesRegex(RuntimeError, "no valid tlog entries"): sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
 
     def test_invalid_cosign_json_fails_closed(self):
         runner = Mock(return_value=Mock(returncode=0, stdout="not-json", stderr=""))
-        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
-            policy = self.policy(); policy["trusted_keys"] = [policy["trusted_keys"][0]]
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub", "TEST_REKOR_A": "rekor-a.pub"}, clear=False):
+            policy = self.policy(); policy["trusted_keys"] = [policy["trusted_keys"][0]]; policy["transparency_log"]["trusted_keys"] = [policy["transparency_log"]["trusted_keys"][0]]
             with self.assertRaisesRegex(RuntimeError, "invalid JSON"): sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
 
-    def test_policy_requires_transparency_log_identity(self):
-        policy = self.policy(); del policy["transparency_log"]["log_id"]
+    def test_policy_requires_rekor_key_identity(self):
+        policy = self.policy(); del policy["transparency_log"]["trusted_keys"][0]["log_id"]
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(policy, f); path = f.name
         try:
-            with self.assertRaisesRegex(RuntimeError, "pin the expected Rekor log ID"): sandbox.load_signing_policy(path)
+            with self.assertRaisesRegex(RuntimeError, "must pin a log ID"): sandbox.load_signing_policy(path)
         finally: Path(path).unlink(missing_ok=True)
 
 
