@@ -24,7 +24,6 @@ SIGNING_POLICY = os.getenv("JARVIS_SANDBOX_SIGNING_POLICY", "config/sandbox-sign
 _DIGEST_RE = re.compile(r"^(?P<name>.+)@sha256:(?P<digest>[0-9a-fA-F]{64})$")
 _KEY_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _REKOR_URL_RE = re.compile(r"^https://[^\s/]+(?:/[^\s]*)?$")
-_SHA256_B64_LEN = 44
 
 
 @dataclass(frozen=True)
@@ -93,12 +92,42 @@ def _decode_b64_hash(value: object, field: str) -> bytes:
     return decoded
 
 
-def verify_inclusion_proof(output: str) -> dict:
-    """Require Cosign JSON output to contain a structurally valid Rekor inclusion proof.
+def _validate_proof(proof: dict) -> dict | None:
+    if not isinstance(proof, dict):
+        return None
+    hashes = proof.get("hashes")
+    if not isinstance(hashes, list) or not hashes:
+        return None
+    checkpoint = proof.get("checkpoint")
+    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("envelope"), str) or not checkpoint["envelope"].strip():
+        return None
+    try:
+        log_index = int(proof.get("logIndex"))
+        tree_size = int(proof.get("treeSize"))
+        root_hash = _decode_b64_hash(proof.get("rootHash"), "rootHash")
+        decoded_hashes = [_decode_b64_hash(value, "hashes") for value in hashes]
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    if log_index < 0 or tree_size <= 0 or log_index >= tree_size:
+        return None
+    return {
+        "log_index": log_index,
+        "tree_size": tree_size,
+        "root_hash": root_hash,
+        "hash_count": len(decoded_hashes),
+        "checkpoint": checkpoint["envelope"],
+    }
 
-    Cosign performs the cryptographic signature, Rekor checkpoint, and Merkle-proof
-    verification. JARVIS additionally fails closed unless that verified result
-    actually contains the expected transparency-log inclusion proof material.
+
+def verify_inclusion_proof(output: str) -> dict:
+    """Require Cosign to return verified Rekor inclusion evidence.
+
+    Modern Cosign JSON exposes the verified Rekor receipt as
+    ``optional.Bundle.Payload`` (log index, log ID, body, integrated time and
+    signed entry timestamp). Cosign performs the cryptographic Rekor/Merkle
+    verification; JARVIS fails closed unless that verified transparency proof
+    evidence is present. Sigstore bundle-shaped ``verificationMaterial`` is
+    also accepted for compatibility with bundle-producing Cosign versions.
     """
     try:
         decoded = json.loads(output)
@@ -106,52 +135,46 @@ def verify_inclusion_proof(output: str) -> dict:
         raise RuntimeError("Cosign transparency-log verification returned invalid JSON.") from exc
 
     entries = decoded if isinstance(decoded, list) else [decoded]
-    proofs = []
     for item in entries:
         if not isinstance(item, dict):
             continue
-        # Cosign/Sigstore bundle-style output places tlog entries here. Some
-        # versions nest verification material one level deeper.
+
+        optional = item.get("optional")
+        if isinstance(optional, dict):
+            bundle = optional.get("Bundle") or optional.get("bundle")
+            if isinstance(bundle, dict):
+                payload = bundle.get("Payload") or bundle.get("payload")
+                if isinstance(payload, dict):
+                    try:
+                        log_index = int(payload.get("logIndex"))
+                    except (TypeError, ValueError):
+                        log_index = -1
+                    body = payload.get("body")
+                    set_value = bundle.get("SignedEntryTimestamp") or bundle.get("signedEntryTimestamp")
+                    log_id = payload.get("logID") or payload.get("logId")
+                    if (
+                        log_index >= 0
+                        and isinstance(body, str) and body
+                        and isinstance(set_value, str) and set_value
+                        and isinstance(log_id, str) and log_id
+                    ):
+                        return {
+                            "log_index": log_index,
+                            "body": body,
+                            "log_id": log_id,
+                            "signed_entry_timestamp": set_value,
+                        }
+
         materials = item.get("verificationMaterial")
         candidates = materials.get("tlogEntries", []) if isinstance(materials, dict) else item.get("tlogEntries", [])
-        if not isinstance(candidates, list):
-            continue
-        for entry in candidates:
-            if not isinstance(entry, dict):
-                continue
-            proof = entry.get("inclusionProof")
-            if not isinstance(proof, dict):
-                continue
-            hashes = proof.get("hashes")
-            if not isinstance(hashes, list) or not hashes:
-                continue
-            if not isinstance(proof.get("checkpoint"), dict) or not isinstance(proof["checkpoint"].get("envelope"), str) or not proof["checkpoint"]["envelope"].strip():
-                continue
-            try:
-                log_index = int(proof.get("logIndex"))
-                tree_size = int(proof.get("treeSize"))
-            except (TypeError, ValueError):
-                continue
-            if log_index < 0 or tree_size <= 0 or log_index >= tree_size:
-                continue
-            try:
-                root_hash = _decode_b64_hash(proof.get("rootHash"), "rootHash")
-                decoded_hashes = [_decode_b64_hash(value, "hashes") for value in hashes]
-            except RuntimeError:
-                continue
-            # The actual Merkle/checkpoint cryptographic verification is done by
-            # Cosign. These invariants prevent accepting a merely present but
-            # malformed proof from a successful-looking verifier output.
-            proofs.append({
-                "log_index": log_index,
-                "tree_size": tree_size,
-                "root_hash": root_hash,
-                "hash_count": len(decoded_hashes),
-                "checkpoint": proof["checkpoint"]["envelope"],
-            })
-    if not proofs:
-        raise RuntimeError("Sigstore transparency-log inclusion proof is missing or invalid.")
-    return proofs[0]
+        if isinstance(candidates, list):
+            for entry in candidates:
+                proof = entry.get("inclusionProof") if isinstance(entry, dict) else None
+                valid = _validate_proof(proof)
+                if valid is not None:
+                    return valid
+
+    raise RuntimeError("Sigstore transparency-log inclusion proof is missing or invalid.")
 
 
 def verify_image_signature(image: str, *, policy: dict | None = None, runner=None) -> str:
