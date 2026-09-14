@@ -1,8 +1,41 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from app import sandbox
+
+
+class SandboxImageProvenanceTests(unittest.TestCase):
+    DIGEST = "a" * 64
+
+    def test_mutable_tag_is_rejected(self):
+        for image in ("jarvis-sandbox:latest", "jarvis-sandbox:v1", "python:3.11-slim"):
+            with self.assertRaises(ValueError):
+                sandbox.parse_pinned_image(image)
+
+    def test_digest_reference_is_parsed(self):
+        name, digest = sandbox.parse_pinned_image(f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}")
+        self.assertEqual(name, "registry.example/jarvis-sandbox")
+        self.assertEqual(digest, self.DIGEST)
+
+    def test_image_mismatch_is_rejected(self):
+        client = Mock()
+        client.images.get.return_value.attrs = {
+            "RepoDigests": [f"registry.example/jarvis-sandbox@sha256:{'b' * 64}"]
+        }
+        with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+            sandbox.verify_image_digest(client, f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}")
+
+    def test_matching_digest_is_accepted(self):
+        client = Mock()
+        client.images.get.return_value.attrs = {
+            "RepoDigests": [f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}"]
+        }
+        self.assertEqual(
+            sandbox.verify_image_digest(client, f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}"),
+            f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}",
+        )
 
 
 @unittest.skipUnless(sandbox.docker_available(), "Docker daemon unavailable")
@@ -10,7 +43,7 @@ class SandboxIsolationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not sandbox.image_available():
-            raise unittest.SkipTest("JARVIS sandbox image unavailable")
+            raise unittest.SkipTest("JARVIS sandbox image unavailable or not digest-pinned")
         cls.tmp = tempfile.TemporaryDirectory()
         sandbox.WORKSPACE = Path(cls.tmp.name).resolve()
 
