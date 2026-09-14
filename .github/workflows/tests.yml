@@ -14,5 +14,15 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - run: docker build -t jarvis-sandbox:latest -f Dockerfile.sandbox .
+      - name: Build and publish immutable test image
+        run: |
+          docker build -t localhost:5000/jarvis-sandbox:test -f Dockerfile.sandbox .
+          docker run -d --name jarvis-registry -p 5000:5000 registry:2
+          until curl -fsS http://localhost:5000/v2/ >/dev/null; do sleep 1; done
+          docker push localhost:5000/jarvis-sandbox:test
+          DIGEST=$(docker image inspect localhost:5000/jarvis-sandbox:test --format '{{index .RepoDigests 0}}' | sed 's#^localhost:5000/jarvis-sandbox:test@#localhost:5000/jarvis-sandbox@#')
+          test -n "$DIGEST"
+          echo "JARVIS_SANDBOX_IMAGE=$DIGEST" >> "$GITHUB_ENV"
       - run: python -m unittest discover -s tests -v
+      - if: always()
+        run: docker rm -f jarvis-registry >/dev/null 2>&1 || true
