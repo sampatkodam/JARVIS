@@ -12,8 +12,6 @@ from app import sandbox
 class SandboxImageProvenanceTests(unittest.TestCase):
     DIGEST = "a" * 64
     IMAGE = f"registry.example/jarvis-sandbox@sha256:{DIGEST}"
-    ROOT_HASH = base64.b64encode(b"r" * 32).decode()
-    PROOF_HASH = base64.b64encode(b"h" * 32).decode()
 
     def test_mutable_tag_is_rejected(self):
         for image in ("jarvis-sandbox:latest", "jarvis-sandbox:v1", "python:3.11-slim"):
@@ -46,24 +44,25 @@ class SandboxImageProvenanceTests(unittest.TestCase):
     @classmethod
     def valid_cosign_output(cls):
         return json.dumps([{
-            "verificationMaterial": {
-                "tlogEntries": [{
-                    "logIndex": "125680200",
-                    "inclusionProof": {
-                        "logIndex": "3775938",
-                        "rootHash": cls.ROOT_HASH,
-                        "treeSize": "3775939",
-                        "hashes": [cls.PROOF_HASH],
-                        "checkpoint": {"envelope": "rekor.sigstore.dev - signed checkpoint"},
+            "critical": {
+                "image": {"docker-manifest-digest": f"sha256:{cls.DIGEST}"},
+                "type": "cosign container image signature",
+            },
+            "optional": {
+                "Bundle": {
+                    "SignedEntryTimestamp": "c2lnbmVkLWVudHJ5LXRpbWVzdGFtcA==",
+                    "Payload": {
+                        "body": base64.b64encode(b"rekor-entry-body").decode(),
+                        "integratedTime": 1770000000,
+                        "logIndex": 3775938,
+                        "logID": "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
                     },
-                }]
-            }
+                }
+            },
         }])
 
     def test_rotation_accepts_new_key_when_old_key_is_revoked(self):
-        runner = Mock(side_effect=[
-            Mock(returncode=0, stdout=self.valid_cosign_output(), stderr="")
-        ])
+        runner = Mock(return_value=Mock(returncode=0, stdout=self.valid_cosign_output(), stderr=""))
         with patch.dict(os.environ, {"TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub"}, clear=False):
             policy = self.policy()
             policy["trusted_keys"][0]["revoked"] = True
@@ -118,7 +117,8 @@ class SandboxImageProvenanceTests(unittest.TestCase):
 
     def test_missing_inclusion_proof_fails_closed(self):
         runner = Mock(return_value=Mock(returncode=0, stdout=json.dumps([{
-            "verificationMaterial": {"tlogEntries": []}
+            "critical": {"type": "cosign container image signature"},
+            "optional": {},
         }]), stderr=""))
         with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
             policy = self.policy()
@@ -128,12 +128,20 @@ class SandboxImageProvenanceTests(unittest.TestCase):
 
     def test_invalid_inclusion_proof_fails_closed(self):
         invalid = json.loads(self.valid_cosign_output())
-        invalid[0]["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["rootHash"] = "not-base64"
+        invalid[0]["optional"]["Bundle"]["Payload"]["logIndex"] = -1
         runner = Mock(return_value=Mock(returncode=0, stdout=json.dumps(invalid), stderr=""))
         with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
             policy = self.policy()
             policy["trusted_keys"] = [policy["trusted_keys"][0]]
             with self.assertRaisesRegex(RuntimeError, "inclusion proof is missing or invalid"):
+                sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
+
+    def test_cosign_rejecting_invalid_transparency_proof_fails_closed(self):
+        runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="no valid tlog entries found with proposed entry"))
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
+            policy = self.policy()
+            policy["trusted_keys"] = [policy["trusted_keys"][0]]
+            with self.assertRaisesRegex(RuntimeError, "no valid tlog entries"):
                 sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
 
     def test_invalid_cosign_json_fails_closed(self):
