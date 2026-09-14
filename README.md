@@ -22,6 +22,7 @@ Cloud-first autonomous personal agent with a persistent queue, live task logs, s
 - Digest-pinned sandbox image verification; mutable tags are rejected
 - Required Cosign signature verification with rotating trusted keys and explicit key IDs
 - Required Sigstore/Rekor transparency-log inclusion-proof verification
+- Explicit trusted Rekor log identity and signed checkpoint-state validation
 - Revoked signing keys are never accepted
 - Network, filesystem, process, CPU, memory, capability, and privilege isolation
 - Planner -> Executor -> Critic loop
@@ -36,15 +37,19 @@ registry.example/jarvis-sandbox@sha256:<64-hex-digest>
 
 Mutable references such as `jarvis-sandbox:latest` or `jarvis-sandbox:v1` are rejected before execution. The daemon's `RepoDigests` are checked against the requested digest immediately before container creation; a missing or mismatched digest fails closed.
 
-JARVIS additionally requires a valid Cosign signature from an active trusted signing key in `config/sandbox-signing-policy.json`. The policy supports multiple trusted keys, stable explicit key IDs, an optional `key_id` to select one key during a controlled rotation, and per-key `revoked` state. A revoked key is excluded before verification and therefore cannot authorize an image. During rotation, the old key can remain trusted while the new key is introduced; once the new key is deployed, the old key is marked revoked without changing the image execution path.
+JARVIS requires a valid Cosign signature from an active trusted signing key in `config/sandbox-signing-policy.json`. The policy supports multiple trusted keys, stable explicit key IDs, an optional `key_id` to select one key during a controlled rotation, and per-key `revoked` state. A revoked key is excluded before verification and therefore cannot authorize an image.
 
-Public keys are provisioned out-of-band through environment variables such as `JARVIS_SANDBOX_COSIGN_PUBLIC_KEY_A` and `JARVIS_SANDBOX_COSIGN_PUBLIC_KEY_B`. The repository contains no signing private keys. Missing keys, unsigned images, invalid signatures, revoked-key attempts, malformed policies, unknown key IDs, verifier errors, and missing or malformed transparency-log proofs all fail closed.
+Public keys are provisioned out-of-band through environment variables. The repository contains no signing private keys. Missing keys, unsigned images, invalid signatures, revoked-key attempts, malformed policies, unknown key IDs, verifier errors, and transparency verification failures all fail closed.
 
-For every candidate key, JARVIS invokes Cosign against the exact digest with the configured Rekor transparency-log endpoint and JSON output. A successful Cosign exit is not sufficient by itself: JARVIS requires the verified output to contain a non-empty Rekor inclusion proof with a valid SHA-256 root hash, proof hashes, valid log/tree indexes, and a signed checkpoint envelope. Cosign remains responsible for the cryptographic signature, Merkle inclusion, and checkpoint verification; JARVIS adds an explicit fail-closed contract that a transparency proof must actually be present in the successful verification result.
+The transparency policy pins the expected Rekor log identity (`log_id`) and checkpoint origin prefix. For every candidate key, JARVIS invokes Cosign against the exact image digest with the configured Rekor endpoint and JSON output. JARVIS then requires the verification result to contain an inclusion proof whose log identity exactly matches the pinned trusted log ID. The proof must contain a valid SHA-256 root hash, proof hashes, valid log/tree indexes, and a signed checkpoint envelope.
 
-The exact digest-pinned image reference is passed to Cosign. When no explicit `key_id` is configured, JARVIS tries active trusted keys until one verifies both the signature and transparency-log inclusion. When `key_id` is configured, only that key may authorize the image. Every successful execution records the signing key ID and the fact that transparency-log verification succeeded.
+The checkpoint is explicitly parsed and checked: its origin must match the configured Rekor origin prefix, its tree size and root hash must exactly match the inclusion proof, and its signature line must identify the expected Rekor host. Cosign remains responsible for cryptographically verifying the signature, Merkle inclusion, and checkpoint signature against Sigstore's trust root; JARVIS adds these explicit identity/state checks so a proof from an unexpected log or a checkpoint inconsistent with the proof cannot authorize execution.
 
-The checked-in `Dockerfile.sandbox` also pins its Python base image by digest. The CI workflow builds and pushes an ephemeral test image, obtains its immutable digest, and exercises the sandbox against that digest. Signature/provenance regression tests use a mocked Cosign verifier to deterministically cover unsigned images, invalid signatures, valid signatures, key rotation, explicit key selection, revoked-key rejection, missing inclusion proofs, invalid inclusion proofs, and malformed verifier output.
+The checked-in policy currently pins the public `rekor.sigstore.dev` log ID from Sigstore's production trusted root. Sigstore's trusted root identifies that public log with key ID `wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0=`. citeturn3search0
+
+The exact digest-pinned image reference is passed to Cosign. When no explicit `key_id` is configured, JARVIS tries active trusted keys until one verifies both the signature and transparency evidence. Every successful execution records the signing key ID and the fact that transparency-log verification succeeded.
+
+The checked-in `Dockerfile.sandbox` also pins its Python base image by digest. The CI workflow builds and pushes an ephemeral test image, obtains its immutable digest, and exercises the sandbox against that digest. Regression tests cover unsigned/invalid signatures, key rotation, revoked-key rejection, missing inclusion proofs, unexpected Rekor log IDs, invalid checkpoints, checkpoint state mismatches, valid checkpoint acceptance, and malformed verifier output.
 
 Sandbox containers mount only the configured workspace read/write. The container root filesystem is read-only, `/tmp` is a bounded `noexec` tmpfs, Linux capabilities are dropped, `no-new-privileges` is enabled, and CPU/memory/process limits are enforced. Network access is disabled by default; dependency installation commands receive explicit temporary bridge networking.
 
@@ -106,7 +111,7 @@ notepad .env
 uvicorn app.main:app --reload
 ```
 
-Before autonomous execution, configure `JARVIS_SANDBOX_IMAGE` with the exact trusted image digest and configure the public keys referenced by `config/sandbox-signing-policy.json`. A deployment should rotate keys by first adding the replacement key, validating signatures and transparency-log proofs with it, and only then marking the old key `revoked: true`. If no active trusted key can verify both the exact digest and its Sigstore inclusion proof, JARVIS refuses execution rather than falling back to the host.
+Before autonomous execution, configure `JARVIS_SANDBOX_IMAGE` with the exact trusted image digest and configure the public keys referenced by the sandbox signing policy. If the trusted Rekor log identity changes, update the pinned `transparency_log.log_id` only after validating the replacement against the Sigstore trusted root. If no active trusted key can verify the exact digest and its expected Rekor log/checkpoint state, JARVIS refuses execution rather than falling back to the host.
 
 Open http://127.0.0.1:8000
 
@@ -115,9 +120,9 @@ Open http://127.0.0.1:8000
 python -m unittest discover -s tests -v
 ```
 
-The tests cover queue concurrency/retry behavior, persistent memory, conversation history, Gemini extraction, sandbox filesystem/network/resource isolation, mutable-tag rejection, digest mismatch rejection, unsigned-image rejection, invalid-signature rejection, valid-signature acceptance, multi-key rotation, explicit key selection, revoked-key rejection, missing Rekor inclusion proofs, invalid inclusion proofs, and malformed transparency-verifier output.
+The tests cover queue concurrency/retry behavior, persistent memory, conversation history, Gemini extraction, sandbox filesystem/network/resource isolation, mutable-tag rejection, digest mismatch rejection, signature validation, multi-key rotation, explicit key selection, revoked-key rejection, missing transparency evidence, unexpected Rekor log IDs, invalid checkpoints, checkpoint/root/tree-state mismatch, valid checkpoint acceptance, and malformed verifier output.
 
 ## Data and privacy
 The memory database is local SQLite by default. Only material explicitly sent to Gemini for extraction/chat is processed by the configured Gemini API. Memory extraction filters obvious secret material and does not intentionally persist credentials. The workspace extractor is bounded to small source/config/text files.
 
-The autonomous execution path is fail-closed behind an OS-level Docker sandbox with immutable, signed image provenance verification and mandatory Sigstore transparency-log inclusion. The remaining trust boundary includes the Docker daemon, the configured trusted image registry, the Sigstore/Rekor verification roots used by Cosign, and the operator-provisioned Cosign trust keys/policy.
+The autonomous execution path is fail-closed behind an OS-level Docker sandbox with immutable, signed image provenance, mandatory Sigstore transparency evidence, explicit Rekor log identity validation, and checkpoint-state validation. The remaining trust boundary includes the Docker daemon, the configured trusted image registry, Sigstore's trusted root used by Cosign, and the operator-provisioned Cosign trust keys/policy.
