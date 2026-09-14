@@ -23,9 +23,7 @@ class SandboxImageProvenanceTests(unittest.TestCase):
 
     def test_image_mismatch_is_rejected(self):
         client = Mock()
-        client.images.get.return_value.attrs = {
-            "RepoDigests": [f"registry.example/jarvis-sandbox@sha256:{'b' * 64}"]
-        }
+        client.images.get.return_value.attrs = {"RepoDigests": [f"registry.example/jarvis-sandbox@sha256:{'b' * 64}"]}
         with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
             sandbox.verify_image_digest(client, self.IMAGE)
 
@@ -35,39 +33,66 @@ class SandboxImageProvenanceTests(unittest.TestCase):
         self.assertEqual(sandbox.verify_image_digest(client, self.IMAGE), self.IMAGE)
 
     @staticmethod
-    def signing_policy():
-        return {"version": 1, "verifier": "cosign", "required": True, "public_key_env": "TEST_COSIGN_KEY"}
+    def policy():
+        return {"version": 2, "verifier": "cosign", "required": True, "trusted_keys": [
+            {"id": "key-a", "public_key_env": "TEST_KEY_A", "revoked": False},
+            {"id": "key-b", "public_key_env": "TEST_KEY_B", "revoked": False},
+        ]}
 
-    def test_unsigned_image_is_rejected(self):
-        runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="no matching signatures"))
-        with patch.dict(os.environ, {"TEST_COSIGN_KEY": "trusted.pub"}, clear=False):
-            with self.assertRaisesRegex(RuntimeError, "signature verification failed"):
-                sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
-        runner.assert_called_once_with(
-            ["cosign", "verify", "--key", "trusted.pub", self.IMAGE],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
+    def test_rotation_accepts_new_key_when_old_key_is_revoked(self):
+        runner = Mock(side_effect=[Mock(returncode=1, stdout="", stderr="old key rejected"), Mock(returncode=0, stdout="verified", stderr="")])
+        with patch.dict(os.environ, {"TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub"}, clear=False):
+            policy = self.policy()
+            policy["trusted_keys"][0]["revoked"] = True
+            self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
+        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
 
-    def test_invalid_signature_is_rejected(self):
-        runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="invalid signature"))
-        with patch.dict(os.environ, {"TEST_COSIGN_KEY": "trusted.pub"}, clear=False):
-            with self.assertRaisesRegex(RuntimeError, "invalid signature"):
-                sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
+    def test_revoked_key_is_never_invoked(self):
+        runner = Mock(return_value=Mock(returncode=0, stdout="verified", stderr=""))
+        with patch.dict(os.environ, {"TEST_KEY_A": "revoked.pub", "TEST_KEY_B": "new.pub"}, clear=False):
+            policy = self.policy()
+            policy["trusted_keys"][0]["revoked"] = True
+            self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
+        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
+
+    def test_explicit_revoked_key_id_is_rejected(self):
+        runner = Mock()
+        with patch.dict(os.environ, {"TEST_KEY_A": "revoked.pub"}, clear=False):
+            policy = self.policy()
+            policy["key_id"] = "key-a"
+            policy["trusted_keys"][0]["revoked"] = True
+            with self.assertRaisesRegex(RuntimeError, "revoked"):
+                sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner)
+        runner.assert_not_called()
+
+    def test_explicit_key_id_selects_rotation_target(self):
+        runner = Mock(return_value=Mock(returncode=0, stdout="verified", stderr=""))
+        with patch.dict(os.environ, {"TEST_KEY_A": "old.pub", "TEST_KEY_B": "new.pub"}, clear=False):
+            policy = self.policy()
+            policy["key_id"] = "key-b"
+            self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-b")
+        runner.assert_called_once_with(["cosign", "verify", "--key", "new.pub", self.IMAGE], capture_output=True, text=True, check=False, timeout=30)
+
+    def test_no_active_keys_is_invalid_policy(self):
+        policy = self.policy()
+        for key in policy["trusted_keys"]:
+            key["revoked"] = True
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            import json
+            json.dump(policy, f)
+            path = f.name
+        try:
+            with self.assertRaisesRegex(RuntimeError, "no active trusted keys"):
+                sandbox.load_signing_policy(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
 
     def test_valid_signature_is_accepted(self):
         runner = Mock(return_value=Mock(returncode=0, stdout="verified", stderr=""))
-        with patch.dict(os.environ, {"TEST_COSIGN_KEY": "trusted.pub"}, clear=False):
-            sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
-        runner.assert_called_once_with(
-            ["cosign", "verify", "--key", "trusted.pub", self.IMAGE],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
+        with patch.dict(os.environ, {"TEST_KEY_A": "trusted.pub"}, clear=False):
+            policy = self.policy()
+            policy["trusted_keys"] = [policy["trusted_keys"][0]]
+            self.assertEqual(sandbox.verify_image_signature(self.IMAGE, policy=policy, runner=runner), "key-a")
 
 
 @unittest.skipUnless(sandbox.docker_available(), "Docker daemon unavailable")
