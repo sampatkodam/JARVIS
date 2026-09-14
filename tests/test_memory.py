@@ -1,10 +1,19 @@
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import app.db as db
-from app.memory import add_message, conversation_history, extract_memories, search_memories, upsert_memory
+from app.memory import (
+    _cosine,
+    _rank_memories,
+    add_message,
+    conversation_history,
+    extract_memories,
+    search_memories,
+    upsert_memory,
+)
 
 
 class FakeGemini:
@@ -53,6 +62,57 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(rows[0]["key"], "database-project")
         self.assertGreater(rows[0]["scope_score"], rows[1]["scope_score"])
         self.assertGreater(rows[0]["relevance_score"], rows[1]["relevance_score"])
+
+    def test_scope_priority_order_is_stable_without_requested_scope(self):
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            {"scope": scope, "scope_id": None, "kind": "fact", "key": scope, "content": "same", "confidence": 1.0, "embedding": None, "updated_at": now}
+            for scope in ("global", "conversation", "workspace", "project", "task")
+        ]
+        with patch("app.memory.Gemini", FakeGemini):
+            ranked = _rank_memories("unmatched", rows, limit=10)
+        self.assertEqual([row["scope"] for row in ranked], ["task", "project", "workspace", "conversation", "global"])
+        self.assertEqual([row["scope_score"] for row in ranked], [1.0, 0.96, 0.9, 0.84, 0.78])
+
+    def test_requested_scope_and_scope_id_receive_exact_priority(self):
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            {"scope": "project", "scope_id": "p1", "kind": "fact", "key": "p1", "content": "same", "confidence": 1.0, "embedding": None, "updated_at": now},
+            {"scope": "task", "scope_id": "t1", "kind": "fact", "key": "t1", "content": "same", "confidence": 1.0, "embedding": None, "updated_at": now},
+            {"scope": "global", "scope_id": None, "kind": "fact", "key": "global", "content": "same", "confidence": 1.0, "embedding": None, "updated_at": now},
+        ]
+        with patch("app.memory.Gemini", FakeGemini):
+            ranked = _rank_memories("unmatched", rows, limit=10, scope="project", scope_id="p1")
+        self.assertEqual(ranked[0]["scope"], "project")
+        self.assertEqual(ranked[0]["scope_score"], 1.0)
+
+    def test_unembedded_memory_uses_lexical_fallback(self):
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [{
+            "scope": "global", "scope_id": None, "kind": "fact", "key": "database",
+            "content": "SQLite is the durable database.", "confidence": 1.0,
+            "embedding": None, "updated_at": now,
+        }]
+        with patch("app.memory.Gemini", FakeGemini):
+            ranked = _rank_memories("database", rows, limit=1)
+        self.assertEqual(ranked[0]["lexical_score"], 1.0)
+        self.assertEqual(ranked[0]["semantic_similarity"], 1.0)
+
+    def test_unrelated_embeddings_do_not_get_artificial_similarity(self):
+        self.assertEqual(_cosine([1.0, 0.0], [0.0, 1.0]), 0.0)
+        self.assertEqual(_cosine([1.0, 0.0], [-1.0, 0.0]), 0.0)
+
+    def test_lexical_overlap_boosts_embedded_similarity_without_baseline(self):
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [{
+            "scope": "global", "scope_id": None, "kind": "fact", "key": "database",
+            "content": "Unrelated wording.", "confidence": 1.0,
+            "embedding": '[0.6,0.8]'.encode("utf-8"), "updated_at": now,
+        }]
+        with patch("app.memory.Gemini", FakeGemini):
+            ranked = _rank_memories("database", rows, limit=1)
+        self.assertEqual(ranked[0]["lexical_score"], 1.0)
+        self.assertEqual(ranked[0]["semantic_similarity"], 1.0)
 
     def test_conversation_history_round_trips(self):
         add_message("conv-1", "user", "Remember that the project uses SQLite.")
