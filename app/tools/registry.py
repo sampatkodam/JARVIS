@@ -20,7 +20,10 @@ TOOLS = {
     "git_commit": git_commit,
     "search_memory": search_memory_tool,
 }
-TOOL_DESCRIPTIONS = {name: CAPABILITIES[name].description for name in TOOLS}
+TOOL_DESCRIPTIONS = {
+    name: f"{cap.description} risk={cap.risk_class}"
+    for name, cap in CAPABILITIES.items() if name in TOOLS
+}
 
 
 def _now():
