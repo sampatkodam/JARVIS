@@ -8,6 +8,7 @@ from app import sandbox
 
 class SandboxImageProvenanceTests(unittest.TestCase):
     DIGEST = "a" * 64
+    IMAGE = f"registry.example/jarvis-sandbox@sha256:{DIGEST}"
 
     def test_mutable_tag_is_rejected(self):
         for image in ("jarvis-sandbox:latest", "jarvis-sandbox:v1", "python:3.11-slim"):
@@ -15,7 +16,7 @@ class SandboxImageProvenanceTests(unittest.TestCase):
                 sandbox.parse_pinned_image(image)
 
     def test_digest_reference_is_parsed(self):
-        name, digest = sandbox.parse_pinned_image(f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}")
+        name, digest = sandbox.parse_pinned_image(self.IMAGE)
         self.assertEqual(name, "registry.example/jarvis-sandbox")
         self.assertEqual(digest, self.DIGEST)
 
@@ -25,16 +26,45 @@ class SandboxImageProvenanceTests(unittest.TestCase):
             "RepoDigests": [f"registry.example/jarvis-sandbox@sha256:{'b' * 64}"]
         }
         with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
-            sandbox.verify_image_digest(client, f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}")
+            sandbox.verify_image_digest(client, self.IMAGE)
 
     def test_matching_digest_is_accepted(self):
         client = Mock()
         client.images.get.return_value.attrs = {
-            "RepoDigests": [f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}"]
+            "RepoDigests": [self.IMAGE]
         }
-        self.assertEqual(
-            sandbox.verify_image_digest(client, f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}"),
-            f"registry.example/jarvis-sandbox@sha256:{self.DIGEST}",
+        self.assertEqual(sandbox.verify_image_digest(client, self.IMAGE), self.IMAGE)
+
+    def signing_policy(self):
+        return {"version": 1, "verifier": "cosign", "required": True, "public_key_env": "TEST_COSIGN_KEY"}
+
+    def test_unsigned_image_is_rejected(self):
+        runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="no matching signatures"))
+        with self.assertRaisesRegex(RuntimeError, "signature verification failed"):
+            sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
+        runner.assert_called_once_with(
+            ["cosign", "verify", "--key", None, self.IMAGE],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    def test_invalid_signature_is_rejected(self):
+        runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="invalid signature"))
+        with self.assertRaisesRegex(RuntimeError, "invalid signature"):
+            sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
+
+    def test_valid_signature_is_accepted(self):
+        runner = Mock(return_value=Mock(returncode=0, stdout="verified", stderr=""))
+        with unittest.mock.patch.dict("os.environ", {"TEST_COSIGN_KEY": "trusted.pub"}, clear=False):
+            sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
+        runner.assert_called_once_with(
+            ["cosign", "verify", "--key", "trusted.pub", self.IMAGE],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
         )
 
 
@@ -43,7 +73,7 @@ class SandboxIsolationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not sandbox.image_available():
-            raise unittest.SkipTest("JARVIS sandbox image unavailable or not digest-pinned")
+            raise unittest.SkipTest("JARVIS sandbox image unavailable, digest-pinned, or signed")
         cls.tmp = tempfile.TemporaryDirectory()
         sandbox.WORKSPACE = Path(cls.tmp.name).resolve()
 
