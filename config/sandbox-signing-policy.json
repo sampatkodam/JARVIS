@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "verifier": "cosign",
   "required": true,
   "trusted_keys": [
@@ -16,8 +16,23 @@
   ],
   "transparency_log": {
     "required": true,
-    "rekor_url": "https://rekor.sigstore.dev",
-    "log_id": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0=",
-    "checkpoint_origin_prefix": "rekor.sigstore.dev - "
+    "trusted_keys": [
+      {
+        "id": "rekor-public-2021",
+        "public_key_env": "JARVIS_SANDBOX_REKOR_PUBLIC_KEY_2021",
+        "rekor_url": "https://rekor.sigstore.dev",
+        "log_id": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0=",
+        "checkpoint_origin_prefix": "rekor.sigstore.dev - ",
+        "revoked": false
+      },
+      {
+        "id": "rekor-public-2025-1",
+        "public_key_env": "JARVIS_SANDBOX_REKOR_PUBLIC_KEY_2025_1",
+        "rekor_url": "https://log2025-1.rekor.sigstore.dev",
+        "log_id": "zxGZFVvd0FEmjR8WrFwMdcAJ9vtaY/QXf44Y1wUeP6A=",
+        "checkpoint_origin_prefix": "log2025-1.rekor.sigstore.dev - ",
+        "revoked": false
+      }
+    ]
   }
 }
