@@ -12,7 +12,8 @@ LEASE_SECONDS = 30
 POLL_SECONDS = 0.05
 
 _state_lock = RLock()
-_state = {"status": "idle", "total": 0, "processed": 0, "embedded": 0, "skipped": 0, "failed": 0, "last_memory_id": 0, "last_error": None, "worker_id": None, "heartbeat_at": None, "started_at": None, "updated_at": None}
+_DEFAULT_STATE = {"status": "idle", "total": 0, "processed": 0, "embedded": 0, "skipped": 0, "failed": 0, "last_memory_id": 0, "last_error": None, "worker_id": None, "heartbeat_at": None, "started_at": None, "updated_at": None}
+_state = dict(_DEFAULT_STATE)
 _thread = None
 _stop = Event()
 _WORKER_ID = f"{socket.gethostname()}:{uuid.uuid4()}"
@@ -44,7 +45,9 @@ def migration_status():
     state = _db_state()
     if state is None:
         with _state_lock:
-            state = dict(_state)
+            state = dict(_DEFAULT_STATE)
+            _state.clear()
+            _state.update(state)
     else:
         with _state_lock:
             _state.update(state)
@@ -160,10 +163,11 @@ def start_embedding_migration():
     with _state_lock:
         if _thread and _thread.is_alive():
             return migration_status()
-    _stop.clear()
     status = migration_status()
-    if status["status"] == "failed":
-        _claim_job(reset=True)
+    if status["status"] == "running":
+        return status
+    _stop.clear()
+    _claim_job(reset=status["status"] == "failed")
     _thread = Thread(target=_run, daemon=True, name="jarvis-memory-embedding-migration")
     _thread.start()
     return migration_status()
@@ -172,12 +176,18 @@ def start_embedding_migration():
 def resume_embedding_migration():
     global _thread
     status = migration_status()
-    if status["status"] not in {"running", "stopped", "stale"}:
+    if status["status"] == "running":
+        with _state_lock:
+            if _thread and _thread.is_alive():
+                return status
+        return status
+    if status["status"] not in {"stopped", "stale"}:
         return status
     with _state_lock:
         if _thread and _thread.is_alive():
             return migration_status()
     _stop.clear()
+    _claim_job()
     _thread = Thread(target=_run, daemon=True, name="jarvis-memory-embedding-migration")
     _thread.start()
     return migration_status()
