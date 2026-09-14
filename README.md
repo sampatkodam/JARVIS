@@ -20,12 +20,13 @@ Cloud-first autonomous personal agent with a persistent queue, live task logs, s
 - Workspace-scoped filesystem tools
 - Docker-backed OS sandbox for autonomous shell/Git execution
 - Digest-pinned sandbox image verification; mutable tags are rejected
-- Required Cosign signature verification against a trusted public-key policy
+- Required Cosign signature verification with rotating trusted keys and explicit key IDs
+- Revoked signing keys are never accepted
 - Network, filesystem, process, CPU, memory, capability, and privilege isolation
 - Planner -> Executor -> Critic loop
 - No local LLM/Ollama required
 
-## Sandbox provenance, signing, and pinning
+## Sandbox provenance, signing, pinning, and key rotation
 Autonomous tool execution never falls back to the host shell. JARVIS requires `JARVIS_SANDBOX_IMAGE` to be an immutable Docker reference of the form:
 
 ```text
@@ -34,11 +35,13 @@ registry.example/jarvis-sandbox@sha256:<64-hex-digest>
 
 Mutable references such as `jarvis-sandbox:latest` or `jarvis-sandbox:v1` are rejected before execution. The daemon's `RepoDigests` are checked against the requested digest immediately before container creation; a missing or mismatched digest fails closed.
 
-JARVIS additionally requires a valid signature from the trusted signer configured by `config/sandbox-signing-policy.json`. The policy requires Cosign verification with the public key at the path supplied by `JARVIS_SANDBOX_COSIGN_PUBLIC_KEY`. The exact digest-pinned image reference is passed to Cosign. Missing keys, unsigned images, invalid signatures, malformed policies, and verifier errors all fail closed.
+JARVIS additionally requires a valid Cosign signature from an active trusted signing key in `config/sandbox-signing-policy.json`. The policy supports multiple trusted keys, stable explicit key IDs, an optional `key_id` to select one key during a controlled rotation, and per-key `revoked` state. A revoked key is excluded before verification and therefore cannot authorize an image. During rotation, the old key can remain trusted while the new key is introduced; once the new key is deployed, the old key is marked revoked without changing the image execution path.
 
-The repository intentionally contains no signing private key and no fake public key. Operators must provision the trusted public key out-of-band and protect the corresponding private signing key. Production deployments should publish the sandbox image to an authenticated trusted registry and configure its exact manifest digest plus the trusted Cosign public key.
+Public keys are provisioned out-of-band through environment variables such as `JARVIS_SANDBOX_COSIGN_PUBLIC_KEY_A` and `JARVIS_SANDBOX_COSIGN_PUBLIC_KEY_B`. The repository contains no signing private keys. Missing keys, unsigned images, invalid signatures, revoked-key attempts, malformed policies, unknown key IDs, and verifier errors all fail closed.
 
-The checked-in `Dockerfile.sandbox` also pins its Python base image by digest. The test workflow creates a temporary registry, pushes the built image, and obtains its immutable digest for sandbox integration testing. Signature-specific regression tests use a mocked Cosign verifier to exercise unsigned, invalid, and valid outcomes deterministically.
+The exact digest-pinned image reference is passed to Cosign. When no explicit `key_id` is configured, JARVIS tries active trusted keys until one verifies. When `key_id` is configured, only that key may authorize the image. Every successful execution records the signing key ID alongside the verified image digest.
+
+The checked-in `Dockerfile.sandbox` also pins its Python base image by digest. The CI workflow builds and pushes an ephemeral test image, obtains its immutable digest, and exercises the sandbox against that digest. Signature-specific regression tests use a mocked Cosign verifier to deterministically cover unsigned images, invalid signatures, valid signatures, key rotation, explicit key selection, and revoked-key rejection.
 
 Sandbox containers mount only the configured workspace read/write. The container root filesystem is read-only, `/tmp` is a bounded `noexec` tmpfs, Linux capabilities are dropped, `no-new-privileges` is enabled, and CPU/memory/process limits are enforced. Network access is disabled by default; dependency installation commands receive explicit temporary bridge networking.
 
@@ -100,7 +103,7 @@ notepad .env
 uvicorn app.main:app --reload
 ```
 
-Before autonomous execution, configure both `JARVIS_SANDBOX_IMAGE` with the exact digest of the trusted sandbox image and `JARVIS_SANDBOX_COSIGN_PUBLIC_KEY` with the trusted Cosign public-key path. If either is absent, malformed, mutable, unavailable, unsigned, invalid, or mismatched, JARVIS refuses execution rather than falling back to the host.
+Before autonomous execution, configure `JARVIS_SANDBOX_IMAGE` with the exact trusted image digest and configure the public keys referenced by `config/sandbox-signing-policy.json`. A deployment should rotate keys by first adding the replacement key, validating signatures with it, and only then marking the old key `revoked: true`. If no active trusted key can verify the exact digest, JARVIS refuses execution rather than falling back to the host.
 
 Open http://127.0.0.1:8000
 
@@ -109,9 +112,9 @@ Open http://127.0.0.1:8000
 python -m unittest discover -s tests -v
 ```
 
-The tests cover queue concurrency/retry behavior, persistent memory, conversation history, Gemini extraction, sandbox filesystem/network/resource isolation, mutable-tag rejection, digest mismatch rejection, unsigned-image rejection, invalid-signature rejection, and valid-signature acceptance.
+The tests cover queue concurrency/retry behavior, persistent memory, conversation history, Gemini extraction, sandbox filesystem/network/resource isolation, mutable-tag rejection, digest mismatch rejection, unsigned-image rejection, invalid-signature rejection, valid-signature acceptance, multi-key rotation, explicit key selection, and revoked-key rejection.
 
 ## Data and privacy
 The memory database is local SQLite by default. Only material explicitly sent to Gemini for extraction/chat is processed by the configured Gemini API. Memory extraction filters obvious secret material and does not intentionally persist credentials. The workspace extractor is bounded to small source/config/text files.
 
-The autonomous execution path is now fail-closed behind an OS-level Docker sandbox with immutable, signed image provenance verification. The remaining trust boundary includes the Docker daemon, the configured trusted image registry, and the operator-provisioned Cosign trust key.
+The autonomous execution path is fail-closed behind an OS-level Docker sandbox with immutable, signed image provenance verification. The remaining trust boundary includes the Docker daemon, the configured trusted image registry, and the operator-provisioned Cosign trust keys/policy.
