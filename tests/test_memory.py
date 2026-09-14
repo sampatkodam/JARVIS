@@ -112,7 +112,8 @@ class MemoryTests(unittest.TestCase):
         with patch("app.memory.Gemini", FakeGemini):
             ranked = _rank_memories("database", rows, limit=1)
         self.assertEqual(ranked[0]["lexical_score"], 1.0)
-        self.assertEqual(ranked[0]["semantic_similarity"], 1.0)
+        self.assertEqual(ranked[0]["semantic_similarity"], 0.75)
+        self.assertGreater(ranked[0]["semantic_similarity"], _cosine([1.0, 0.0], [0.6, 0.8]))
 
     def test_conversation_history_round_trips(self):
         add_message("conv-1", "user", "Remember that the project uses SQLite.")
