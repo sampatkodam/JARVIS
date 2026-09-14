@@ -1,7 +1,8 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from app import sandbox
 
@@ -30,20 +31,20 @@ class SandboxImageProvenanceTests(unittest.TestCase):
 
     def test_matching_digest_is_accepted(self):
         client = Mock()
-        client.images.get.return_value.attrs = {
-            "RepoDigests": [self.IMAGE]
-        }
+        client.images.get.return_value.attrs = {"RepoDigests": [self.IMAGE]}
         self.assertEqual(sandbox.verify_image_digest(client, self.IMAGE), self.IMAGE)
 
-    def signing_policy(self):
+    @staticmethod
+    def signing_policy():
         return {"version": 1, "verifier": "cosign", "required": True, "public_key_env": "TEST_COSIGN_KEY"}
 
     def test_unsigned_image_is_rejected(self):
         runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="no matching signatures"))
-        with self.assertRaisesRegex(RuntimeError, "signature verification failed"):
-            sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
+        with patch.dict(os.environ, {"TEST_COSIGN_KEY": "trusted.pub"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "signature verification failed"):
+                sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
         runner.assert_called_once_with(
-            ["cosign", "verify", "--key", None, self.IMAGE],
+            ["cosign", "verify", "--key", "trusted.pub", self.IMAGE],
             capture_output=True,
             text=True,
             check=False,
@@ -52,12 +53,13 @@ class SandboxImageProvenanceTests(unittest.TestCase):
 
     def test_invalid_signature_is_rejected(self):
         runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="invalid signature"))
-        with self.assertRaisesRegex(RuntimeError, "invalid signature"):
-            sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
+        with patch.dict(os.environ, {"TEST_COSIGN_KEY": "trusted.pub"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "invalid signature"):
+                sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
 
     def test_valid_signature_is_accepted(self):
         runner = Mock(return_value=Mock(returncode=0, stdout="verified", stderr=""))
-        with unittest.mock.patch.dict("os.environ", {"TEST_COSIGN_KEY": "trusted.pub"}, clear=False):
+        with patch.dict(os.environ, {"TEST_COSIGN_KEY": "trusted.pub"}, clear=False):
             sandbox.verify_image_signature(self.IMAGE, policy=self.signing_policy(), runner=runner)
         runner.assert_called_once_with(
             ["cosign", "verify", "--key", "trusted.pub", self.IMAGE],
